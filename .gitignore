@@ -1,0 +1,15 @@
+# Graphify
+/graphify-out/
+
+# Claude
+/.claude/
+
+# Python
+/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Exclude virtual environments
+/.venv/
+.env
