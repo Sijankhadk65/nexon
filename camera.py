@@ -14,6 +14,7 @@ writes a single snapshot to `frame.jpg` instead of opening a window.
 
 import sys
 import time
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -29,6 +30,40 @@ COLOR_FORMAT = ob.OBFormat.MJPG
 
 # wait_for_frames timeout (ms). A couple of frame intervals is plenty at 30 fps.
 FRAME_TIMEOUT_MS = 1000
+
+
+@dataclass(frozen=True)
+class CameraIntrinsics:
+    """Pinhole intrinsics for the color frame (px). Turns pixels + depth into 3D mm."""
+
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+    @classmethod
+    def from_ob(cls, intr) -> "CameraIntrinsics":
+        return cls(intr.fx, intr.fy, intr.cx, intr.cy, intr.width, intr.height)
+
+    def deproject(self, u, v, z_mm):
+        """Pixel (u,v) + its depth z_mm → 3D point (X,Y,Z) in mm, camera frame.
+
+        Vectorized: u, v, z_mm may be scalars or equal-length NumPy arrays.
+        """
+        x = (np.asarray(u) - self.cx) * z_mm / self.fx
+        y = (np.asarray(v) - self.cy) * z_mm / self.fy
+        return x, y, z_mm
+
+
+@dataclass
+class CapturedFrame:
+    """One synchronized capture: color, optional depth aligned to it, and intrinsics."""
+
+    bgr: np.ndarray
+    depth_mm: np.ndarray | None  # float32 HxW, same size as bgr, millimeters (0 = invalid)
+    intrinsics: CameraIntrinsics | None
 
 
 def frame_to_bgr(frame) -> np.ndarray | None:
@@ -70,11 +105,22 @@ class OrbbecCamera:
     iterating (e.g. `break`), so downstream object detection sets the pace.
     """
 
-    def __init__(self, width=WIDTH, height=HEIGHT, fps=FPS, color_format=COLOR_FORMAT):
+    def __init__(
+        self,
+        width=WIDTH,
+        height=HEIGHT,
+        fps=FPS,
+        color_format=COLOR_FORMAT,
+        with_depth=False,
+    ):
         self.width = width
         self.height = height
         self.fps = fps
         self.color_format = color_format
+        self.with_depth = with_depth
+        self.intrinsics: CameraIntrinsics | None = None
+        # Software-aligns depth onto the color frame (1:1 pixels) when depth is on.
+        self._align = ob.AlignFilter(ob.OBStreamType.COLOR_STREAM) if with_depth else None
 
         ctx = ob.Context()
         ctx.set_logger_level(ob.OBLogLevel.NONE)  # keep the terminal chat-clean
@@ -90,7 +136,7 @@ class OrbbecCamera:
         self._started = False
 
     def _build_config(self) -> "ob.Config":
-        """Enable the requested color mode, falling back to the sensor default."""
+        """Enable the requested color mode (and depth if asked), else sensor defaults."""
         profiles = self._pipeline.get_stream_profile_list(ob.OBSensorType.COLOR_SENSOR)
         profile = self._select_color_profile(profiles)
         config = ob.Config()
@@ -99,6 +145,15 @@ class OrbbecCamera:
         vsp = profile.as_video_stream_profile()
         self.width, self.height = vsp.get_width(), vsp.get_height()
         self.fps, self.color_format = vsp.get_fps(), vsp.get_format()
+        # Color intrinsics double as the aligned-depth intrinsics (depth is warped
+        # into the color frame), so this is what we deproject depth with.
+        self.intrinsics = CameraIntrinsics.from_ob(vsp.get_intrinsic())
+
+        if self.with_depth:
+            depth_profiles = self._pipeline.get_stream_profile_list(
+                ob.OBSensorType.DEPTH_SENSOR
+            )
+            config.enable_stream(depth_profiles.get_default_video_stream_profile())
         return config
 
     def _select_color_profile(self, profiles):
@@ -139,6 +194,40 @@ class OrbbecCamera:
         if color is None:
             return None
         return frame_to_bgr(color)
+
+    def capture(self) -> CapturedFrame | None:
+        """Grab a synchronized color(+aligned depth) frame, or None on a miss.
+
+        With depth enabled, returns depth in millimeters registered pixel-for-pixel
+        to the BGR image, plus the intrinsics needed to deproject it to 3D.
+        """
+        frames = self._pipeline.wait_for_frames(FRAME_TIMEOUT_MS)
+        if frames is None:
+            return None
+
+        depth_mm = None
+        if self._align is not None:
+            # Alignment needs both raw frames present; skip partial framesets.
+            if frames.get_depth_frame() is None or frames.get_color_frame() is None:
+                return None
+            aligned = self._align.process(frames)
+            if aligned is None:
+                return None
+            frames = aligned.as_frame_set()
+            depth = frames.get_depth_frame()
+            if depth is not None:
+                raw = np.frombuffer(depth.get_data(), dtype=np.uint16).reshape(
+                    depth.get_height(), depth.get_width()
+                )
+                depth_mm = raw.astype(np.float32) * depth.get_depth_scale()
+
+        color = frames.get_color_frame()
+        if color is None:
+            return None
+        bgr = frame_to_bgr(color)
+        if bgr is None:
+            return None
+        return CapturedFrame(bgr=bgr, depth_mm=depth_mm, intrinsics=self.intrinsics)
 
     def frames(self):
         """Yield BGR frames continuously until the caller stops iterating."""

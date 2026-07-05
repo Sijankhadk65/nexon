@@ -25,6 +25,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 import tools
+import vision
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
@@ -254,8 +255,23 @@ def main():
     else:
         print("[tts: ELEVENLABS_API_KEY not set — running text-only]", file=sys.stderr)
 
+    # Open the camera + live preview window now so you can watch what the robot
+    # sees during the chat. Best-effort: if the camera isn't ready, the chat still
+    # runs and detect_objects will report the error to Claude if it's called.
+    show_window = os.environ.get("NEXON_NO_WINDOW") is None
+    vision_on = False
+    try:
+        vision.get_hub(show_window=show_window).ensure_started()
+        vision_on = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[vision: camera unavailable ({exc}); detection will error if used]",
+              file=sys.stderr)
+
     tts_on = speaker is not None
-    print(f"\nnexon chat — model: {MODEL} | voice: {'on' if tts_on else 'off'}")
+    print(f"\nnexon chat — model: {MODEL} | voice: {'on' if tts_on else 'off'} "
+          f"| vision: {'on' if vision_on else 'off'}")
+    if vision_on and show_window:
+        print("Live window open — keys there: d depth view, s snapshot, q close window.")
     print("Commands: /reset, /mute, /unmute, /exit or /quit.\n")
 
     while True:
