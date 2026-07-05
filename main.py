@@ -40,13 +40,34 @@ log = logging.getLogger("nexon")
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
-SYSTEM_PROMPT = (
+BASE_SYSTEM_PROMPT = (
     "You are nexon, an assistant that orchestrates a robot equipped with a camera. "
     "You have a detect_objects tool that looks through the robot's camera to find "
     "objects you name. Use it whenever the user asks what you can see, where "
     "something is, or to identify physical parts. Be concise; describe what you find "
     "in natural language rather than reading out raw coordinates."
 )
+
+# Supported forced languages (ISO code -> name). "auto" lets Scribe detect per
+# utterance — convenient, but background speech in another language can hijack it,
+# so a single forced language is the robust default.
+LANGUAGES = {"en": "English", "hi": "Hindi", "de": "German"}
+DEFAULT_LANG = os.environ.get("NEXON_LANG", "en").lower()
+
+
+def system_prompt_for(lang: str) -> str:
+    """Base prompt plus a directive to always answer in the forced language."""
+    name = LANGUAGES.get(lang)
+    if name:
+        return (f"{BASE_SYSTEM_PROMPT} Always respond in {name}, regardless of the "
+                f"language of the input.")
+    return BASE_SYSTEM_PROMPT  # "auto" — no language constraint
+
+
+def stt_lang(lang: str) -> str | None:
+    """The ISO code to force on Scribe, or None to auto-detect."""
+    return lang if lang in LANGUAGES else None
+
 
 # Cap tool-call rounds per turn so a misbehaving loop can't run away.
 MAX_TOOL_ITERS = 5
@@ -281,10 +302,12 @@ def main():
         import tools
         import vision
 
+    lang = DEFAULT_LANG if DEFAULT_LANG in LANGUAGES or DEFAULT_LANG == "auto" else "en"
+
     model = build_model()
     tools_by_name = {t.name: t for t in tools.ALL_TOOLS}
     agent = model.bind_tools(tools.ALL_TOOLS)
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages = [SystemMessage(content=system_prompt_for(lang))]
 
     # ElevenLabs powers both voice out (TTS) and voice in (Scribe STT), so one
     # client is shared. Without the key, nexon runs text-only in both directions.
@@ -313,21 +336,27 @@ def main():
         log.warning("vision: camera unavailable (%s); detection will error if used", exc)
 
     # Voice input (push-to-talk Scribe STT) reuses the ElevenLabs client, so it's
-    # only available when the key is set.
-    voice = stt.VoiceInput(client=el) if el else None
+    # only available when the key is set. It's forced to `lang` so background speech
+    # in another language can't hijack the transcription.
+    voice = stt.VoiceInput(client=el, language=stt_lang(lang)) if el else None
     voice_in = False
 
+    lang_name = LANGUAGES.get(lang, "auto-detect")
     tts_on = speaker is not None
     print(f"\nnexon chat — model: {MODEL} | voice out: {'on' if tts_on else 'off'} "
-          f"| vision: {'on' if vision_on else 'off'}")
+          f"| vision: {'on' if vision_on else 'off'} | lang: {lang_name}")
     if vision_on and show_window:
         print("Live window open — keys there: d depth view, s snapshot, q close window.")
-    print("Commands: /voice (toggle mic input), /reset, /mute, /unmute, /exit or /quit.\n")
+    print("Commands: /lang <en|hi|de|auto>, /voice, /reset, /mute, /unmute, /exit or /quit.\n")
 
     while True:
+        # Write the prompt to stdout ourselves (not via input()'s prompt arg):
+        # readline sends its prompt to stderr, which we've redirected to the log,
+        # so an input(prompt) prompt would be invisible on screen.
         prompt = "you [🎤 Enter to talk]> " if voice_in else "you> "
+        print(prompt, end="", flush=True)
         try:
-            typed = input(prompt).strip()
+            typed = input().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -335,6 +364,21 @@ def main():
         # Commands are always typed (work in either input mode).
         if typed in ("/exit", "/quit"):
             break
+        if typed.startswith("/lang"):
+            parts = typed.split()
+            choice = parts[1].lower() if len(parts) == 2 else ""
+            if choice in LANGUAGES or choice == "auto":
+                lang = choice
+                messages[0] = SystemMessage(content=system_prompt_for(lang))
+                if voice is not None:
+                    voice.language = stt_lang(lang)
+                name = LANGUAGES.get(lang, "auto-detect")
+                print(f"(language set to {name})\n")
+                log.info("language set to %s", lang)
+            else:
+                cur = LANGUAGES.get(lang, "auto-detect")
+                print(f"(usage: /lang <en|hi|de|auto> — current: {cur})\n")
+            continue
         if typed == "/voice":
             if voice is None:
                 print("(voice input unavailable — set ELEVENLABS_API_KEY)\n")
@@ -347,7 +391,7 @@ def main():
                 print("(voice input off)\n")
             continue
         if typed == "/reset":
-            messages = [SystemMessage(content=SYSTEM_PROMPT)]
+            messages = [SystemMessage(content=system_prompt_for(lang))]
             print("(history cleared)\n")
             continue
         if typed == "/mute":

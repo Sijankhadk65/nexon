@@ -30,6 +30,26 @@ STT_MODEL = os.environ.get("NEXON_STT_MODEL", "scribe_v1")
 LANGUAGE = os.environ.get("NEXON_STT_LANG") or None
 
 
+def _script_mismatch(text: str, lang: str | None) -> bool:
+    """True if `text` is clearly not in the forced language's script.
+
+    ElevenLabs' language_code is only a hint, so Scribe can still return Hindi for
+    a forced-English session (e.g. someone else speaking Hindi nearby). Hindi uses
+    Devanagari while English/German use Latin, so a script check catches that hard
+    case. It can't tell English from German (both Latin) — that's fine; the goal is
+    to stop off-language audio hijacking the conversation.
+    """
+    if not lang or not text:
+        return False
+    devanagari = sum(1 for c in text if "ऀ" <= c <= "ॿ")
+    latin = sum(1 for c in text if "a" <= c.lower() <= "z")
+    if lang == "hi":
+        return devanagari == 0 and latin > 0  # forced Hindi but Latin came back
+    if lang in ("en", "de"):
+        return devanagari > latin  # forced Latin-script language but got Devanagari
+    return False
+
+
 def default_mic() -> str | None:
     """Pick the capture device for arecord's -D flag.
 
@@ -114,10 +134,16 @@ class VoiceInput:
             resp = client.speech_to_text.convert(file=audio, **kwargs)
 
         text = (getattr(resp, "text", "") or "").strip()
+        # Scribe's language_code is only a hint; enforce the forced language by
+        # discarding a transcript that came back in the wrong script.
+        if _script_mismatch(text, self.language):
+            log.info("voice: discarded off-language transcript (forced %s): %r",
+                     self.language, text)
+            return ""
         if not self.language and text:
-            lang = getattr(resp, "language_code", None)
-            if lang:
-                log.info("voice: detected language '%s'", lang)
+            detected = getattr(resp, "language_code", None)
+            if detected:
+                log.info("voice: detected language '%s'", detected)
         return text
 
     def listen(self) -> str:
