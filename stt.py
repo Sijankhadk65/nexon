@@ -21,6 +21,9 @@ import os
 import re
 import subprocess
 import tempfile
+import wave
+
+import numpy as np
 
 log = logging.getLogger("nexon")
 
@@ -28,6 +31,15 @@ SAMPLE_RATE = 16000  # mono 16 kHz WAV is plenty for speech and keeps uploads sm
 STT_MODEL = os.environ.get("NEXON_STT_MODEL", "scribe_v1")
 # None => let Scribe auto-detect the language; set NEXON_STT_LANG to pin it.
 LANGUAGE = os.environ.get("NEXON_STT_LANG") or None
+
+# Silence-based endpointing (used only for barge-in capture, where pressing Enter to
+# stop would be awkward mid-sentence). Record until the user has spoken and then gone
+# quiet for VAD_SILENCE_S. Thresholds are int16 RMS per 30 ms frame.
+VAD_FRAME_MS = 30
+VAD_THRESHOLD = float(os.environ.get("NEXON_VAD_THRESHOLD", "500"))
+VAD_SILENCE_S = float(os.environ.get("NEXON_VAD_SILENCE_S", "3.5"))
+VAD_MAX_S = float(os.environ.get("NEXON_VAD_MAX_S", "30"))       # hard cap on length
+VAD_START_TIMEOUT_S = float(os.environ.get("NEXON_VAD_START_TIMEOUT_S", "8"))  # give up if silent
 
 
 def _script_mismatch(text: str, lang: str | None) -> bool:
@@ -157,6 +169,89 @@ class VoiceInput:
                 return ""
             return self.transcribe(wav_path)
         except Exception as exc:  # noqa: BLE001 — a failed transcription shouldn't crash the chat
+            log.warning("voice: transcription failed: %s", exc)
+            return ""
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+    def record_until_silence(self, silence_s: float = VAD_SILENCE_S,
+                             max_s: float = VAD_MAX_S,
+                             start_timeout_s: float = VAD_START_TIMEOUT_S) -> str | None:
+        """Record until ~silence_s of quiet follows speech, then stop on its own.
+
+        Unlike record() (which stops on Enter), this reads the mic stream, tracks
+        per-frame loudness, and endpoints itself once the user finishes talking —
+        used for barge-in, where the user is already mid-sentence. Writes the captured
+        PCM to a WAV and returns its path, or None if nothing was said / on failure.
+        """
+        frame_bytes = int(self.sample_rate * VAD_FRAME_MS / 1000) * 2  # 2 bytes/sample
+        frame_s = VAD_FRAME_MS / 1000
+        cmd = ["arecord", "-q", "-f", "S16_LE", "-r", str(self.sample_rate),
+               "-c", "1", "-t", "raw"]
+        if self.device:
+            cmd += ["-D", self.device]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            log.error("voice: 'arecord' not found — install alsa-utils")
+            return None
+
+        frames = bytearray()
+        started = False       # have we heard speech yet?
+        silent = 0.0          # seconds of continuous silence since last speech
+        elapsed = 0.0
+        try:
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break  # stream ended
+                frames += buf
+                elapsed += frame_s
+                samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+                rms = float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+                if rms >= VAD_THRESHOLD:
+                    started = True
+                    silent = 0.0
+                elif started:
+                    silent += frame_s
+                    if silent >= silence_s:  # spoke, then went quiet — done
+                        break
+                if elapsed >= max_s:
+                    break
+                if not started and elapsed >= start_timeout_s:
+                    break  # user never spoke
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        if not started:
+            return None
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        with wave.open(tmp.name, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)  # S16_LE
+            w.setframerate(self.sample_rate)
+            w.writeframes(bytes(frames))
+        return tmp.name
+
+    def listen_until_silence(self) -> str:
+        """Like listen(), but endpoints on silence instead of Enter (for barge-in)."""
+        wav_path = self.record_until_silence()
+        if wav_path is None:
+            return ""
+        try:
+            if os.path.getsize(wav_path) < self.sample_rate * 2 * 0.3:
+                return ""
+            return self.transcribe(wav_path)
+        except Exception as exc:  # noqa: BLE001
             log.warning("voice: transcription failed: %s", exc)
             return ""
         finally:

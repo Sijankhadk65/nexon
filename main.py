@@ -16,6 +16,7 @@ Env vars:
 import logging
 import os
 import queue
+import subprocess
 import sys
 import threading
 import warnings
@@ -26,11 +27,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from elevenlabs import VoiceSettings
-from elevenlabs import stream as play_audio_stream
 from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+import fsm
 import logs
 
 # tools/vision/stt are imported inside main() under logs.mute_stdout so their
@@ -104,18 +105,34 @@ def build_model() -> ChatAnthropic:
     return ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)
 
 
-def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
+def run_agent_turn(agent, messages, tools_by_name, speaker, speaking, machine,
+                   interrupt) -> bool:
     """Stream Claude's reply, run any tool calls, feed results back, repeat.
 
     Only the final natural-language prose is spoken; tool calls and their JSON
     results are Claude's private working state. Appends every AIMessage/ToolMessage
-    to `messages`. Returns True on success; on error the caller rolls back the turn.
+    to `messages`. Drives the FSM: WAITING while a request is in flight, RESPONSE from
+    the first token, with THINKING/SPEAKING/TOOL phases inside it. Returns True on
+    success; on error the caller rolls back the turn. If `interrupt` (barge-in) is set
+    it stops promptly and returns True with nothing appended — the caller sees the set
+    event and rolls the turn back.
     """
     for _ in range(MAX_TOOL_ITERS):
+        if interrupt.is_set():
+            return True
+        # Request in flight; no tokens back yet. On the 2nd+ round this is the pause
+        # after a tool result while Claude decides what to say next.
+        machine.to(fsm.State.WAITING)
         gathered = None
         response = []
         try:
             for chunk in agent.stream(messages):
+                if interrupt.is_set():  # user barged in — stop streaming at once
+                    return True
+                # First token of this round — the reply is now under way.
+                if machine.state is not fsm.State.RESPONSE:
+                    machine.to(fsm.State.RESPONSE)
+                    machine.phase_to(fsm.Phase.THINKING)
                 # AIMessageChunks accumulate (text + tool-call fragments) via `+`.
                 gathered = chunk if gathered is None else gathered + chunk
                 text = chunk_text(chunk)
@@ -136,6 +153,8 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
         # which would otherwise sit unspoken until the post-tool response.
         if speaking:
             speaker.flush()
+            if response:  # audio is now queued/playing (overlaps the next round)
+                machine.phase_to(fsm.Phase.SPEAKING)
 
         if gathered is None:
             return True
@@ -147,6 +166,7 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
 
         # Run each requested tool and hand the results back for the next round.
         # Tool traffic is log-only — the screen stays a clean conversation.
+        machine.phase_to(fsm.Phase.TOOL)
         for call in tool_calls:
             log.info("TOOL_CALL: %s(%s)", call["name"], call["args"])
             tool_obj = tools_by_name.get(call["name"])
@@ -183,7 +203,10 @@ class Speaker:
 
     Per assistant turn: `speak()` starts a background playback thread, `push()`
     feeds tokens (flushing whole sentences to the synth queue as they complete),
-    and `finish()` flushes the tail and blocks until playback ends.
+    and `finish()` flushes the tail and blocks until playback ends. `stop()` cancels
+    a turn mid-flight (barge-in): it kills mpv so audio cuts off at once rather than
+    draining the buffer. mpv is managed here directly (not via elevenlabs' stream()
+    helper) precisely so there's a process handle to kill.
     """
 
     def __init__(self, client: ElevenLabs, voice_id: str):
@@ -192,6 +215,8 @@ class Speaker:
         self._q: queue.Queue | None = None
         self._buf = ""
         self._thread: threading.Thread | None = None
+        self._mpv: subprocess.Popen | None = None
+        self._stop = threading.Event()
 
     @staticmethod
     def _last_boundary(buf: str) -> int | None:
@@ -217,7 +242,7 @@ class Speaker:
         """Yield audio bytes for each queued sentence, in order, into one mpv."""
         while True:
             sentence = self._q.get()
-            if sentence is _DONE:
+            if sentence is _DONE or self._stop.is_set():
                 return
             try:
                 audio = self.client.text_to_speech.convert(
@@ -227,7 +252,10 @@ class Speaker:
                     output_format=OUTPUT_FORMAT,
                     voice_settings=VOICE_SETTINGS,
                 )
-                yield from audio
+                for chunk in audio:
+                    if self._stop.is_set():  # barge-in during synthesis
+                        return
+                    yield chunk
             except Exception as exc:  # noqa: BLE001
                 print(f"\n[tts error: {exc}]", file=sys.stderr)
                 # Stop synthesizing but drain the queue so finish() won't block.
@@ -236,16 +264,64 @@ class Speaker:
                 return
 
     def _run(self):
+        """Own an mpv process and pump synthesized audio into it until done/stopped."""
         try:
-            play_audio_stream(self._audio_gen())  # blocks, feeding mpv
+            self._mpv = subprocess.Popen(
+                ["mpv", "--no-cache", "--no-terminal", "--", "fd://0"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            print("\n[tts: mpv not found — install mpv to hear replies]", file=sys.stderr)
+            while self._q.get() is not _DONE:  # drain so finish() won't block
+                pass
+            return
+
+        try:
+            for chunk in self._audio_gen():
+                if self._stop.is_set():
+                    break
+                self._mpv.stdin.write(chunk)
+                self._mpv.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass  # mpv was killed (stop()) mid-write
         except Exception as exc:  # noqa: BLE001
             print(f"\n[tts playback error: {exc}]", file=sys.stderr)
+
+        mpv = self._mpv
+        self._mpv = None
+        if mpv is None:
+            return
+        if self._stop.is_set():
+            mpv.kill()  # cut off audio already buffered inside mpv
+        else:
+            try:
+                mpv.stdin.close()
+            except OSError:
+                pass
+            mpv.wait()  # let it finish playing what's buffered
 
     def speak(self):
         self._q = queue.Queue()
         self._buf = ""
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    @property
+    def interrupted(self) -> bool:
+        return self._stop.is_set()
+
+    def stop(self):
+        """Cancel playback immediately (barge-in). Safe to call any time."""
+        if self._q is None:
+            return
+        self._stop.set()
+        self._q.put(_DONE)  # unblock a get() waiting for the next sentence
+        mpv = self._mpv
+        if mpv is not None:
+            mpv.kill()
 
     def push(self, token: str):
         if self._q is None or not token:
@@ -270,15 +346,18 @@ class Speaker:
             self._buf = ""
 
     def finish(self):
-        if self._q is not None:
+        # If stopped (barge-in), the tail is abandoned and the queue may be drained
+        # already — just join the thread and reset. Otherwise flush the last sentence.
+        if self._q is not None and not self._stop.is_set():
             if self._buf.strip():
                 self._q.put(self._buf)
-            self._buf = ""
             self._q.put(_DONE)
+        self._buf = ""
         if self._thread is not None:
             self._thread.join()
         self._q = None
         self._thread = None
+        self._mpv = None
 
 
 def main():
@@ -298,6 +377,7 @@ def main():
     # Import the heavy modules with stdout muted so the SDK's "load extensions"
     # banner and any other import chatter land in the log, not on screen.
     with logs.mute_stdout(log_path):
+        import barge
         import stt
         import tools
         import vision
@@ -340,82 +420,154 @@ def main():
     # in another language can't hijack the transcription.
     voice = stt.VoiceInput(client=el, language=stt_lang(lang)) if el else None
     voice_in = False
+    speaking = False  # set per turn; referenced by the FSM hook below
+
+    # Barge-in: interrupt nexon by speaking while it talks. Needs both voice in and
+    # out; off unless NEXON_BARGE is truthy, since without echo cancellation an
+    # open-speaker setup can hear nexon's own voice (see barge.py).
+    can_barge = voice is not None and speaker is not None
+    barge_enabled = can_barge and os.environ.get("NEXON_BARGE", "").lower() in ("1", "true", "yes", "on")
+    listener = barge.Listener(device=voice.device) if can_barge else None
+    interrupt = threading.Event()
+
+    def barge_fired():
+        """Called from the listener thread the moment the user starts talking."""
+        interrupt.set()
+        if speaker is not None:
+            speaker.stop()
+        log.info("barge-in: user started speaking — cutting off the reply")
+
+    def on_state(state, _phase):
+        """Arm the mic watcher only while nexon is actually speaking (RESPONSE)."""
+        if listener is None:
+            return
+        active = barge_enabled and voice_in and speaking
+        if state is fsm.State.RESPONSE and active:
+            listener.arm(barge_fired)
+        else:
+            listener.disarm()
 
     lang_name = LANGUAGES.get(lang, "auto-detect")
     tts_on = speaker is not None
     print(f"\nnexon chat — model: {MODEL} | voice out: {'on' if tts_on else 'off'} "
-          f"| vision: {'on' if vision_on else 'off'} | lang: {lang_name}")
+          f"| vision: {'on' if vision_on else 'off'} | lang: {lang_name}"
+          f"{' | barge-in: on' if barge_enabled else ''}")
     if vision_on and show_window:
         print("Live window open — keys there: d depth view, s snapshot, q close window.")
-    print("Commands: /lang <en|hi|de|auto>, /voice, /reset, /mute, /unmute, /exit or /quit.\n")
+    print("Commands: /lang <en|hi|de|auto>, /voice, /barge, /reset, /mute, /unmute, /exit or /quit.\n")
+
+    # Drives IDLE -> LISTENING -> WAITING -> RESPONSE; its on_change hook gates the
+    # barge-in mic (live only during RESPONSE) and is the seam for a status line/LED.
+    machine = fsm.Machine(on_change=on_state)
+
+    def capture(vad: bool = False) -> str:
+        """One utterance: LISTENING, then transcribe. Push-to-talk stops on Enter;
+        vad=True endpoints on silence instead (used after a barge-in)."""
+        machine.to(fsm.State.LISTENING)
+        if vad:
+            print("  listening… [stops after you pause] ", end="", flush=True)
+            text = voice.listen_until_silence()
+        else:
+            print("  recording… [Enter to stop] ", end="", flush=True)
+            text = voice.listen()
+        print()
+        return text
+
+    pending_listen = False  # after a barge-in, jump straight into recording
 
     while True:
-        # Write the prompt to stdout ourselves (not via input()'s prompt arg):
-        # readline sends its prompt to stderr, which we've redirected to the log,
-        # so an input(prompt) prompt would be invisible on screen.
-        prompt = "you [🎤 Enter to talk]> " if voice_in else "you> "
-        print(prompt, end="", flush=True)
-        try:
-            typed = input().strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
+        machine.to(fsm.State.IDLE)
 
-        # Commands are always typed (work in either input mode).
-        if typed in ("/exit", "/quit"):
-            break
-        if typed.startswith("/lang"):
-            parts = typed.split()
-            choice = parts[1].lower() if len(parts) == 2 else ""
-            if choice in LANGUAGES or choice == "auto":
-                lang = choice
-                messages[0] = SystemMessage(content=system_prompt_for(lang))
-                if voice is not None:
-                    voice.language = stt_lang(lang)
-                name = LANGUAGES.get(lang, "auto-detect")
-                print(f"(language set to {name})\n")
-                log.info("language set to %s", lang)
-            else:
-                cur = LANGUAGES.get(lang, "auto-detect")
-                print(f"(usage: /lang <en|hi|de|auto> — current: {cur})\n")
-            continue
-        if typed == "/voice":
-            if voice is None:
-                print("(voice input unavailable — set ELEVENLABS_API_KEY)\n")
-                continue
-            voice_in = not voice_in
-            if voice_in:
-                print(f"(voice input on — mic: {voice.device or 'system default'}; "
-                      f"press Enter to talk)\n")
-            else:
-                print("(voice input off)\n")
-            continue
-        if typed == "/reset":
-            messages = [SystemMessage(content=system_prompt_for(lang))]
-            print("(history cleared)\n")
-            continue
-        if typed == "/mute":
-            tts_on = False
-            print("(voice out off)\n")
-            continue
-        if typed == "/unmute":
-            tts_on = speaker is not None
-            print(f"(voice out {'on' if tts_on else 'unavailable'})\n")
-            continue
-
-        if voice_in and typed == "":
-            # Push-to-talk: record until the next Enter, then transcribe.
-            print("  recording… [Enter to stop] ", end="", flush=True)
-            user_input = voice.listen()
-            print()
+        if pending_listen and voice is not None and voice_in:
+            # User barged in — they're already talking, so record now, don't prompt.
+            # Endpoint on silence: pressing Enter mid-sentence would be awkward.
+            pending_listen = False
+            user_input = capture(vad=True)
             if not user_input:
                 print("(heard nothing — try again)\n")
                 continue
             print(f"you (voice)> {user_input}\n")
-        elif typed == "":
-            continue
+            typed = None  # skip the command/prompt path below
         else:
-            user_input = typed
+            pending_listen = False
+            # Write the prompt to stdout ourselves (not via input()'s prompt arg):
+            # readline sends its prompt to stderr, which we've redirected to the log,
+            # so an input(prompt) prompt would be invisible on screen.
+            prompt = "you [🎤 Enter to talk]> " if voice_in else "you> "
+            print(prompt, end="", flush=True)
+            try:
+                typed = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+        # Commands are always typed (work in either input mode). Skipped on the
+        # barge-in fast path, where typed is None and user_input is already set.
+        if typed is not None:
+            if typed in ("/exit", "/quit"):
+                break
+            if typed.startswith("/lang"):
+                parts = typed.split()
+                choice = parts[1].lower() if len(parts) == 2 else ""
+                if choice in LANGUAGES or choice == "auto":
+                    lang = choice
+                    messages[0] = SystemMessage(content=system_prompt_for(lang))
+                    if voice is not None:
+                        voice.language = stt_lang(lang)
+                    name = LANGUAGES.get(lang, "auto-detect")
+                    print(f"(language set to {name})\n")
+                    log.info("language set to %s", lang)
+                else:
+                    cur = LANGUAGES.get(lang, "auto-detect")
+                    print(f"(usage: /lang <en|hi|de|auto> — current: {cur})\n")
+                continue
+            if typed == "/voice":
+                if voice is None:
+                    print("(voice input unavailable — set ELEVENLABS_API_KEY)\n")
+                    continue
+                voice_in = not voice_in
+                if voice_in:
+                    print(f"(voice input on — mic: {voice.device or 'system default'}; "
+                          f"press Enter to talk)\n")
+                else:
+                    print("(voice input off)\n")
+                continue
+            if typed == "/barge":
+                if not can_barge:
+                    print("(barge-in unavailable — needs both voice in and out)\n")
+                    continue
+                barge_enabled = not barge_enabled
+                if barge_enabled and not voice_in:
+                    print("(barge-in on — turn on /voice too; interrupt nexon by "
+                          "speaking while it talks)\n")
+                else:
+                    print(f"(barge-in {'on' if barge_enabled else 'off'})\n")
+                log.info("barge-in %s", "on" if barge_enabled else "off")
+                continue
+            if typed == "/reset":
+                messages = [SystemMessage(content=system_prompt_for(lang))]
+                print("(history cleared)\n")
+                continue
+            if typed == "/mute":
+                tts_on = False
+                print("(voice out off)\n")
+                continue
+            if typed == "/unmute":
+                tts_on = speaker is not None
+                print(f"(voice out {'on' if tts_on else 'unavailable'})\n")
+                continue
+
+            if voice_in and typed == "":
+                # Push-to-talk: record until the next Enter, then transcribe.
+                user_input = capture()
+                if not user_input:
+                    print("(heard nothing — try again)\n")
+                    continue
+                print(f"you (voice)> {user_input}\n")
+            elif typed == "":
+                continue
+            else:
+                user_input = typed
 
         log.info("USER: %s", user_input)
 
@@ -425,19 +577,28 @@ def main():
         messages.append(HumanMessage(content=user_input))
 
         speaking = tts_on and speaker is not None
+        interrupt.clear()  # fresh for this turn; the FSM hook may arm the mic watcher
         if speaking:
             speaker.speak()
 
         print("claude> ", end="", flush=True)
         try:
-            ok = run_agent_turn(agent, messages, tools_by_name, speaker, speaking)
+            ok = run_agent_turn(agent, messages, tools_by_name, speaker, speaking,
+                                machine, interrupt)
         except KeyboardInterrupt:
             print("\n(interrupted)\n")
             ok = False
 
         if speaking:
             speaker.finish()  # flush the tail sentence and wait for playback
+        machine.to(fsm.State.IDLE)  # release the mic watcher before we prompt/listen
 
+        if interrupt.is_set():
+            # Barge-in: drop the cut-off exchange and go capture what the user said.
+            del messages[history_len:]
+            print("\n(interrupted — listening)\n")
+            pending_listen = voice_in
+            continue
         if not ok:
             del messages[history_len:]  # discard the whole failed turn
             continue
