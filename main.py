@@ -17,6 +17,16 @@ import os
 import queue
 import sys
 import threading
+import warnings
+
+# Quiet noisy ML/Qt logs so the interactive prompt stays readable. Set before the
+# heavy imports below (which pull in cv2/transformers) so the settings take effect.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 from elevenlabs import VoiceSettings
 from elevenlabs import stream as play_audio_stream
@@ -93,6 +103,11 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
         except Exception as exc:  # noqa: BLE001
             print(f"\n[error: {exc}]\n")
             return False
+
+        # Speak this response now — critically, the preamble before a tool call,
+        # which would otherwise sit unspoken until the post-tool response.
+        if speaking:
+            speaker.flush()
 
         if gathered is None:
             return True
@@ -210,6 +225,18 @@ class Speaker:
             chunk, self._buf = self._buf[:idx], self._buf[idx:]
             if chunk.strip():
                 self._q.put(chunk)
+
+    def flush(self):
+        """Speak whatever is buffered right now, without ending the turn.
+
+        Called at the end of each response so a complete-but-unterminated sentence
+        (e.g. a preamble like "Let me take a look.") is spoken immediately, rather
+        than waiting for the next response — which may be many seconds away across a
+        tool call.
+        """
+        if self._q is not None and self._buf.strip():
+            self._q.put(self._buf)
+            self._buf = ""
 
     def finish(self):
         if self._q is not None:

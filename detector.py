@@ -134,8 +134,15 @@ class GroundingDinoDetector:
         device: str | None = None,
         default_targets: list[str] | None = None,
     ):
+        import logging as _logging
+
         import torch
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        from transformers.utils import logging as hf_logging
+
+        # Keep the terminal clean: only surface real errors from these libraries.
+        hf_logging.set_verbosity_error()
+        _logging.getLogger("huggingface_hub").setLevel(_logging.ERROR)
 
         self.model_id = model_id
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,10 +182,14 @@ class GroundingDinoDetector:
         h, w = image_bgr.shape[:2]
         results = self._post_process(inputs, outputs, min_confidence, (h, w))
 
+        # Newer transformers return string phrases under "text_labels"; "labels"
+        # is deprecated (and will become integer ids). Prefer the former.
+        labels = results.get("text_labels")
+        if labels is None:
+            labels = results["labels"]
+
         detections: list[Detection] = []
-        for box, score, label in zip(
-            results["boxes"], results["scores"], results["labels"]
-        ):
+        for box, score, label in zip(results["boxes"], results["scores"], labels):
             x1, y1, x2, y2 = (int(v) for v in box.tolist())
             text = label if isinstance(label, str) else str(label)
             detections.append(
@@ -193,17 +204,21 @@ class GroundingDinoDetector:
 
     def _post_process(self, inputs, outputs, threshold, target_size):
         """Call transformers' grounded post-processor across API versions."""
+        import warnings
+
         pp = self._processor.post_process_grounded_object_detection
         common = dict(
             outputs=outputs,
             input_ids=inputs.input_ids,
             target_sizes=[target_size],
         )
-        # Newer transformers renamed box_threshold -> threshold; try both.
-        try:
-            return pp(**common, threshold=threshold, text_threshold=0.25)[0]
-        except TypeError:
-            return pp(**common, box_threshold=threshold, text_threshold=0.25)[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)  # labels->text_labels notice
+            # Newer transformers renamed box_threshold -> threshold; try both.
+            try:
+                return pp(**common, threshold=threshold, text_threshold=0.25)[0]
+            except TypeError:
+                return pp(**common, box_threshold=threshold, text_threshold=0.25)[0]
 
 
 # --- optional demo ----------------------------------------------------------

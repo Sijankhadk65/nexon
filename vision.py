@@ -29,7 +29,6 @@ from viz import colorize_depth, draw_detections
 
 DETECTOR_BACKEND = os.environ.get("NEXON_DETECTOR", "grounding-dino")
 WINDOW_NAME = "nexon — live vision"
-_WARMUP_FRAMES = 30
 
 
 def _has_display() -> bool:
@@ -58,10 +57,11 @@ class VisionHub:
         print("[vision: starting Gemini 336L (color + depth)…]", file=sys.stderr)
         cam = OrbbecCamera(with_depth=True)
         cam.start()
-        for _ in range(_WARMUP_FRAMES):  # let auto-exposure settle
-            cam.read()
         self._camera = cam
         self._running = True
+        # The capture thread warms up (auto-exposure) in the background; we don't
+        # block the chat prompt on it. look() waits for the first frame via
+        # _latest_capture, and by the time anyone asks, exposure has long settled.
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
