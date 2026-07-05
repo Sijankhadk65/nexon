@@ -266,7 +266,9 @@ def main():
     agent = model.bind_tools(tools.ALL_TOOLS)
     messages = [SystemMessage(content=SYSTEM_PROMPT)]
 
-    # Voice is optional — fall back to text-only if ElevenLabs isn't configured.
+    # ElevenLabs powers both voice out (TTS) and voice in (Scribe STT), so one
+    # client is shared. Without the key, nexon runs text-only in both directions.
+    el = None
     speaker = None
     if os.environ.get("ELEVENLABS_API_KEY"):
         el = ElevenLabs()  # reads ELEVENLABS_API_KEY from env
@@ -295,7 +297,9 @@ def main():
         print(f"[vision: camera unavailable ({exc}); detection will error if used]",
               file=sys.stderr)
 
-    voice = stt.VoiceInput()  # push-to-talk STT; Whisper model loads on first use
+    # Voice input (push-to-talk Scribe STT) reuses the ElevenLabs client, so it's
+    # only available when the key is set.
+    voice = stt.VoiceInput(client=el) if el else None
     voice_in = False
 
     tts_on = speaker is not None
@@ -317,6 +321,9 @@ def main():
         if typed in ("/exit", "/quit"):
             break
         if typed == "/voice":
+            if voice is None:
+                print("(voice input unavailable — set ELEVENLABS_API_KEY)\n")
+                continue
             voice_in = not voice_in
             if voice_in:
                 print(f"(voice input on — mic: {voice.device or 'system default'}; "

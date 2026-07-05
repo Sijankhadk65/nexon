@@ -1,15 +1,19 @@
-"""Offline push-to-talk speech-to-text for voice input.
+"""Push-to-talk speech-to-text via ElevenLabs Scribe.
 
 Records the microphone with `arecord` (ALSA — already on the system, no PortAudio
-needed) while you hold the floor, then transcribes locally with faster-whisper on
-the CPU. No cloud, no per-use cost. The model loads lazily on first use and is
-cached afterwards.
+needed) while you hold the floor, then transcribes with ElevenLabs' Scribe model.
+One cloud provider for all of nexon's voice (in and out), and strongly multilingual
+— German, English, etc. — with robust automatic language detection.
 
 Push-to-talk flow, driven by main.py: recording starts, and `record()` blocks on
-Enter to stop — so you press Enter to begin, speak, and press Enter to end.
+Enter to stop — press Enter to begin, speak, press Enter to end.
 
-Model size via NEXON_WHISPER_MODEL (default base.en — a good speed/accuracy balance
-on CPU; try small.en for more accuracy, tiny.en for more speed).
+Config:
+  NEXON_STT_MODEL  Scribe model id (default "scribe_v1").
+  NEXON_STT_LANG   Pin a language (ISO code, e.g. "de", "en") to skip auto-detect.
+  NEXON_MIC        arecord capture device (default: auto-detected USB mic).
+
+Requires ELEVENLABS_API_KEY (the same key used for text-to-speech).
 """
 
 import os
@@ -18,8 +22,10 @@ import subprocess
 import sys
 import tempfile
 
-SAMPLE_RATE = 16000  # Whisper's native rate; record straight to it
-MODEL_SIZE = os.environ.get("NEXON_WHISPER_MODEL", "base.en")
+SAMPLE_RATE = 16000  # mono 16 kHz WAV is plenty for speech and keeps uploads small
+STT_MODEL = os.environ.get("NEXON_STT_MODEL", "scribe_v1")
+# None => let Scribe auto-detect the language; set NEXON_STT_LANG to pin it.
+LANGUAGE = os.environ.get("NEXON_STT_LANG") or None
 
 
 def default_mic() -> str | None:
@@ -49,22 +55,21 @@ def default_mic() -> str | None:
 
 
 class VoiceInput:
-    def __init__(self, model_size: str = MODEL_SIZE, sample_rate: int = SAMPLE_RATE,
-                 device: str | None = None):
-        self.model_size = model_size
+    def __init__(self, client=None, model_id: str = STT_MODEL,
+                 sample_rate: int = SAMPLE_RATE, device: str | None = None,
+                 language: str | None = LANGUAGE):
+        self._client = client  # an elevenlabs.ElevenLabs; created lazily if None
+        self.model_id = model_id
         self.sample_rate = sample_rate
         self.device = device if device is not None else default_mic()
-        self._model = None
+        self.language = language  # None => auto-detect
 
-    def _ensure_model(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel
+    def _ensure_client(self):
+        if self._client is None:
+            from elevenlabs.client import ElevenLabs
 
-            print(f"[voice: loading Whisper '{self.model_size}' "
-                  f"(first run downloads it)…]", file=sys.stderr)
-            # int8 is the fast CPU path; base.en fits comfortably in memory.
-            self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-        return self._model
+            self._client = ElevenLabs()  # reads ELEVENLABS_API_KEY
+        return self._client
 
     def record(self) -> str | None:
         """Record until the user presses Enter. Returns a WAV path, or None on failure.
@@ -98,10 +103,20 @@ class VoiceInput:
         return tmp.name
 
     def transcribe(self, wav_path: str) -> str:
-        """Transcribe a WAV file to text (faster-whisper decodes it via PyAV)."""
-        model = self._ensure_model()
-        segments, _ = model.transcribe(wav_path, language="en", beam_size=1)
-        return " ".join(seg.text for seg in segments).strip()
+        """Upload the WAV to ElevenLabs Scribe and return the transcript."""
+        client = self._ensure_client()
+        kwargs = {"model_id": self.model_id}
+        if self.language:  # omit entirely to let Scribe auto-detect
+            kwargs["language_code"] = self.language
+        with open(wav_path, "rb") as audio:
+            resp = client.speech_to_text.convert(file=audio, **kwargs)
+
+        text = (getattr(resp, "text", "") or "").strip()
+        if not self.language and text:
+            lang = getattr(resp, "language_code", None)
+            if lang:
+                print(f"[voice: detected language '{lang}']", file=sys.stderr)
+        return text
 
     def listen(self) -> str:
         """Capture one push-to-talk utterance and return its transcript (maybe empty)."""
@@ -113,6 +128,9 @@ class VoiceInput:
             if os.path.getsize(wav_path) < self.sample_rate * 2 * 0.3:
                 return ""
             return self.transcribe(wav_path)
+        except Exception as exc:  # noqa: BLE001 — a failed transcription shouldn't crash the chat
+            print(f"[voice: transcription failed: {exc}]", file=sys.stderr)
+            return ""
         finally:
             try:
                 os.unlink(wav_path)
