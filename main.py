@@ -22,11 +22,22 @@ from elevenlabs import VoiceSettings
 from elevenlabs import stream as play_audio_stream
 from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+import tools
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
-SYSTEM_PROMPT = "You are a helpful, concise assistant."
+SYSTEM_PROMPT = (
+    "You are nexon, an assistant that orchestrates a robot equipped with a camera. "
+    "You have a detect_objects tool that looks through the robot's camera to find "
+    "objects you name. Use it whenever the user asks what you can see, where "
+    "something is, or to identify physical parts. Be concise; describe what you find "
+    "in natural language rather than reading out raw coordinates."
+)
+
+# Cap tool-call rounds per turn so a misbehaving loop can't run away.
+MAX_TOOL_ITERS = 5
 
 # eleven_flash_v2_5 is ElevenLabs' lowest-latency model (~75ms). mp3_44100_128
 # plays cleanly through mpv, and concatenated MP3 chunks stream without gaps.
@@ -58,6 +69,52 @@ def chunk_text(chunk) -> str:
 
 def build_model() -> ChatAnthropic:
     return ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)
+
+
+def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
+    """Stream Claude's reply, run any tool calls, feed results back, repeat.
+
+    Only the final natural-language prose is spoken; tool calls and their JSON
+    results are Claude's private working state. Appends every AIMessage/ToolMessage
+    to `messages`. Returns True on success; on error the caller rolls back the turn.
+    """
+    for _ in range(MAX_TOOL_ITERS):
+        gathered = None
+        try:
+            for chunk in agent.stream(messages):
+                # AIMessageChunks accumulate (text + tool-call fragments) via `+`.
+                gathered = chunk if gathered is None else gathered + chunk
+                text = chunk_text(chunk)
+                if text:
+                    print(text, end="", flush=True)
+                    if speaking:
+                        speaker.push(text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n[error: {exc}]\n")
+            return False
+
+        if gathered is None:
+            return True
+        messages.append(gathered)
+
+        tool_calls = getattr(gathered, "tool_calls", None)
+        if not tool_calls:
+            return True
+
+        # Run each requested tool and hand the results back for the next round.
+        for call in tool_calls:
+            print(f"\n[looking: {call['name']}({call['args']})]", flush=True)
+            tool_obj = tools_by_name.get(call["name"])
+            if tool_obj is None:
+                messages.append(
+                    ToolMessage(content=f"unknown tool {call['name']}",
+                                tool_call_id=call["id"])
+                )
+                continue
+            messages.append(tool_obj.invoke(call))  # returns a ToolMessage
+        print("claude> ", end="", flush=True)
+
+    return True
 
 
 def resolve_voice_id(client: ElevenLabs) -> str | None:
@@ -176,6 +233,8 @@ def main():
         return
 
     model = build_model()
+    tools_by_name = {t.name: t for t in tools.ALL_TOOLS}
+    agent = model.bind_tools(tools.ALL_TOOLS)
     messages = [SystemMessage(content=SYSTEM_PROMPT)]
 
     # Voice is optional — fall back to text-only if ElevenLabs isn't configured.
@@ -223,6 +282,9 @@ def main():
             print(f"(voice {'on' if tts_on else 'unavailable'})\n")
             continue
 
+        # Snapshot history length so a failed/interrupted turn rolls back cleanly —
+        # the turn may append several AIMessages and ToolMessages, not just one.
+        history_len = len(messages)
         messages.append(HumanMessage(content=user_input))
 
         speaking = tts_on and speaker is not None
@@ -230,33 +292,30 @@ def main():
             speaker.speak()
 
         print("claude> ", end="", flush=True)
-        reply_parts = []
         try:
-            for chunk in model.stream(messages):
-                text = chunk_text(chunk)
-                if text:
-                    reply_parts.append(text)
-                    print(text, end="", flush=True)
-                    if speaking:
-                        speaker.push(text)
+            ok = run_agent_turn(agent, messages, tools_by_name, speaker, speaking)
         except KeyboardInterrupt:
             print("\n(interrupted)\n")
-            if speaking:
-                speaker.finish()
-            messages.pop()
-            continue
-        except Exception as exc:  # noqa: BLE001
-            print(f"\n[error: {exc}]\n")
-            if speaking:
-                speaker.finish()
-            messages.pop()
-            continue
+            ok = False
 
         if speaking:
             speaker.finish()  # flush the tail sentence and wait for playback
+
+        if not ok:
+            del messages[history_len:]  # discard the whole failed turn
+            continue
         print("\n")
-        messages.append(AIMessage(content="".join(reply_parts)))
+
+
+def _shutdown():
+    try:
+        tools.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _shutdown()

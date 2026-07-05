@@ -10,5 +10,8 @@ dependencies = [
     "langchain-core>=1.4.8",
     "numpy>=2.4.6",
     "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
     "pyorbbecsdk2>=2.0.18",
+    "torch>=2.12.1",
+    "transformers>=5.13.0",
 ]

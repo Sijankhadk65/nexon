@@ -21,3 +21,5 @@
 
 # Camera capture snapshots
 /frame.jpg
+/detections.jpg
+/Log/
