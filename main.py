@@ -34,6 +34,7 @@ from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+import stt
 import tools
 import vision
 
@@ -294,36 +295,61 @@ def main():
         print(f"[vision: camera unavailable ({exc}); detection will error if used]",
               file=sys.stderr)
 
+    voice = stt.VoiceInput()  # push-to-talk STT; Whisper model loads on first use
+    voice_in = False
+
     tts_on = speaker is not None
-    print(f"\nnexon chat — model: {MODEL} | voice: {'on' if tts_on else 'off'} "
+    print(f"\nnexon chat — model: {MODEL} | voice out: {'on' if tts_on else 'off'} "
           f"| vision: {'on' if vision_on else 'off'}")
     if vision_on and show_window:
         print("Live window open — keys there: d depth view, s snapshot, q close window.")
-    print("Commands: /reset, /mute, /unmute, /exit or /quit.\n")
+    print("Commands: /voice (toggle mic input), /reset, /mute, /unmute, /exit or /quit.\n")
 
     while True:
+        prompt = "you [🎤 Enter to talk]> " if voice_in else "you> "
         try:
-            user_input = input("you> ").strip()
+            typed = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
-        if not user_input:
-            continue
-        if user_input in ("/exit", "/quit"):
+        # Commands are always typed (work in either input mode).
+        if typed in ("/exit", "/quit"):
             break
-        if user_input == "/reset":
+        if typed == "/voice":
+            voice_in = not voice_in
+            if voice_in:
+                print(f"(voice input on — mic: {voice.device or 'system default'}; "
+                      f"press Enter to talk)\n")
+            else:
+                print("(voice input off)\n")
+            continue
+        if typed == "/reset":
             messages = [SystemMessage(content=SYSTEM_PROMPT)]
             print("(history cleared)\n")
             continue
-        if user_input == "/mute":
+        if typed == "/mute":
             tts_on = False
-            print("(voice off)\n")
+            print("(voice out off)\n")
             continue
-        if user_input == "/unmute":
+        if typed == "/unmute":
             tts_on = speaker is not None
-            print(f"(voice {'on' if tts_on else 'unavailable'})\n")
+            print(f"(voice out {'on' if tts_on else 'unavailable'})\n")
             continue
+
+        if voice_in and typed == "":
+            # Push-to-talk: record until the next Enter, then transcribe.
+            print("  recording… [Enter to stop] ", end="", flush=True)
+            user_input = voice.listen()
+            print()
+            if not user_input:
+                print("(heard nothing — try again)\n")
+                continue
+            print(f"you (voice)> {user_input}\n")
+        elif typed == "":
+            continue
+        else:
+            user_input = typed
 
         # Snapshot history length so a failed/interrupted turn rolls back cleanly —
         # the turn may append several AIMessages and ToolMessages, not just one.
