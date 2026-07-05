@@ -13,18 +13,15 @@ Env vars:
   ELEVENLABS_VOICE_ID  - optional; defaults to the first voice on your account
 """
 
+import logging
 import os
 import queue
 import sys
 import threading
 import warnings
 
-# Quiet noisy ML/Qt logs so the interactive prompt stays readable. Set before the
-# heavy imports below (which pull in cv2/transformers) so the settings take effect.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts.warning=false")
-os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -34,9 +31,12 @@ from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-import stt
-import tools
-import vision
+import logs
+
+# tools/vision/stt are imported inside main() under logs.mute_stdout so their
+# SDK/ML startup chatter is captured in the log file, not printed to the screen.
+
+log = logging.getLogger("nexon")
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
@@ -92,18 +92,24 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
     """
     for _ in range(MAX_TOOL_ITERS):
         gathered = None
+        response = []
         try:
             for chunk in agent.stream(messages):
                 # AIMessageChunks accumulate (text + tool-call fragments) via `+`.
                 gathered = chunk if gathered is None else gathered + chunk
                 text = chunk_text(chunk)
                 if text:
-                    print(text, end="", flush=True)
+                    print(text, end="", flush=True)  # screen: the conversation
+                    response.append(text)
                     if speaking:
                         speaker.push(text)
         except Exception as exc:  # noqa: BLE001
-            print(f"\n[error: {exc}]\n")
+            print(f"\n[error — see log]\n")
+            log.exception("agent turn failed: %s", exc)
             return False
+
+        if response:
+            log.info("NEXON: %s", "".join(response).strip())
 
         # Speak this response now — critically, the preamble before a tool call,
         # which would otherwise sit unspoken until the post-tool response.
@@ -119,8 +125,9 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
             return True
 
         # Run each requested tool and hand the results back for the next round.
+        # Tool traffic is log-only — the screen stays a clean conversation.
         for call in tool_calls:
-            print(f"\n[looking: {call['name']}({call['args']})]", flush=True)
+            log.info("TOOL_CALL: %s(%s)", call["name"], call["args"])
             tool_obj = tools_by_name.get(call["name"])
             if tool_obj is None:
                 messages.append(
@@ -128,7 +135,9 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking) -> bool:
                                 tool_call_id=call["id"])
                 )
                 continue
-            messages.append(tool_obj.invoke(call))  # returns a ToolMessage
+            result = tool_obj.invoke(call)  # returns a ToolMessage
+            log.info("TOOL_RESULT: %s", getattr(result, "content", result))
+            messages.append(result)
         print("claude> ", end="", flush=True)
 
     return True
@@ -253,6 +262,7 @@ class Speaker:
 
 def main():
     if not os.environ.get("ANTHROPIC_API_KEY"):
+        # Printed before logging is set up, so it reaches the screen.
         print(
             "ANTHROPIC_API_KEY is not set.\n"
             "Set it before starting the chat, e.g.:\n"
@@ -260,6 +270,16 @@ def main():
             file=sys.stderr,
         )
         return
+
+    global log
+    log, log_path = logs.setup()  # stderr -> log file; screen keeps only conversation
+
+    # Import the heavy modules with stdout muted so the SDK's "load extensions"
+    # banner and any other import chatter land in the log, not on screen.
+    with logs.mute_stdout(log_path):
+        import stt
+        import tools
+        import vision
 
     model = build_model()
     tools_by_name = {t.name: t for t in tools.ALL_TOOLS}
@@ -276,14 +296,9 @@ def main():
         if voice_id:
             speaker = Speaker(el, voice_id)
         else:
-            print(
-                "[tts: no voice available — set ELEVENLABS_VOICE_ID to a voice ID "
-                "from your dashboard (the key may lack the voices_read permission). "
-                "Running text-only.]",
-                file=sys.stderr,
-            )
+            log.warning("tts: no voice available (set ELEVENLABS_VOICE_ID); text-only")
     else:
-        print("[tts: ELEVENLABS_API_KEY not set — running text-only]", file=sys.stderr)
+        log.info("tts: ELEVENLABS_API_KEY not set — running text-only")
 
     # Open the camera + live preview window now so you can watch what the robot
     # sees during the chat. Best-effort: if the camera isn't ready, the chat still
@@ -291,11 +306,11 @@ def main():
     show_window = os.environ.get("NEXON_NO_WINDOW") is None
     vision_on = False
     try:
-        vision.get_hub(show_window=show_window).ensure_started()
+        with logs.mute_stdout(log_path):  # capture SDK stdout during camera start
+            vision.get_hub(show_window=show_window).ensure_started()
         vision_on = True
     except Exception as exc:  # noqa: BLE001
-        print(f"[vision: camera unavailable ({exc}); detection will error if used]",
-              file=sys.stderr)
+        log.warning("vision: camera unavailable (%s); detection will error if used", exc)
 
     # Voice input (push-to-talk Scribe STT) reuses the ElevenLabs client, so it's
     # only available when the key is set.
@@ -358,6 +373,8 @@ def main():
         else:
             user_input = typed
 
+        log.info("USER: %s", user_input)
+
         # Snapshot history length so a failed/interrupted turn rolls back cleanly —
         # the turn may append several AIMessages and ToolMessages, not just one.
         history_len = len(messages)
@@ -385,6 +402,8 @@ def main():
 
 def _shutdown():
     try:
+        import tools  # imported inside main(); re-import here hits the module cache
+
         tools.shutdown()
     except Exception:  # noqa: BLE001
         pass

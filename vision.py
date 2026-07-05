@@ -15,8 +15,8 @@ lock. The window is best-effort: any GUI error disables the preview but never ta
 down the chat. Access the process-wide instance via `get_hub()`.
 """
 
+import logging
 import os
-import sys
 import threading
 import time
 
@@ -26,6 +26,8 @@ from camera import OrbbecCamera
 from detector import load_detector
 from dimensioner import measure_all
 from viz import colorize_depth, draw_detections
+
+log = logging.getLogger("nexon")
 
 DETECTOR_BACKEND = os.environ.get("NEXON_DETECTOR", "grounding-dino")
 WINDOW_NAME = "nexon — live vision"
@@ -54,7 +56,7 @@ class VisionHub:
         """Open the camera and start the capture/preview thread (idempotent)."""
         if self._running:
             return
-        print("[vision: starting Gemini 336L (color + depth)…]", file=sys.stderr)
+        log.info("vision: starting Gemini 336L (color + depth)")
         cam = OrbbecCamera(with_depth=True)
         cam.start()
         self._camera = cam
@@ -114,10 +116,10 @@ class VisionHub:
             elif key == ord("s"):
                 name = f"snapshot_{int(time.time())}.jpg"
                 cv2.imwrite(name, frame)
-                print(f"[vision: saved {name}]", file=sys.stderr)
+                log.info("vision: saved %s", name)
             return True
         except Exception as exc:  # noqa: BLE001
-            print(f"[vision: preview disabled ({exc})]", file=sys.stderr)
+            log.warning("vision: preview disabled (%s)", exc)
             try:
                 cv2.destroyAllWindows()
             except Exception:  # noqa: BLE001
@@ -139,8 +141,8 @@ class VisionHub:
         """Detect `targets` in the latest frame; optionally measure. Publishes overlay."""
         self.ensure_started()
         if self._detector is None:
-            print(f"[vision: loading detector '{self.backend}' "
-                  f"(first run downloads the model)…]", file=sys.stderr)
+            log.info("vision: loading detector '%s' (first run downloads the model)",
+                     self.backend)
             self._detector = load_detector(self.backend)
 
         cap = self._latest_capture()

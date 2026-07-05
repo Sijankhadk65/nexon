@@ -16,11 +16,13 @@ Config:
 Requires ELEVENLABS_API_KEY (the same key used for text-to-speech).
 """
 
+import logging
 import os
 import re
 import subprocess
-import sys
 import tempfile
+
+log = logging.getLogger("nexon")
 
 SAMPLE_RATE = 16000  # mono 16 kHz WAV is plenty for speech and keeps uploads small
 STT_MODEL = os.environ.get("NEXON_STT_MODEL", "scribe_v1")
@@ -86,7 +88,7 @@ class VoiceInput:
         try:
             proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            print("[voice: 'arecord' not found — install alsa-utils]", file=sys.stderr)
+            log.error("voice: 'arecord' not found — install alsa-utils")
             os.unlink(tmp.name)
             return None
 
@@ -115,7 +117,7 @@ class VoiceInput:
         if not self.language and text:
             lang = getattr(resp, "language_code", None)
             if lang:
-                print(f"[voice: detected language '{lang}']", file=sys.stderr)
+                log.info("voice: detected language '%s'", lang)
         return text
 
     def listen(self) -> str:
@@ -129,7 +131,7 @@ class VoiceInput:
                 return ""
             return self.transcribe(wav_path)
         except Exception as exc:  # noqa: BLE001 — a failed transcription shouldn't crash the chat
-            print(f"[voice: transcription failed: {exc}]", file=sys.stderr)
+            log.warning("voice: transcription failed: %s", exc)
             return ""
         finally:
             try:

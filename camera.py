@@ -12,6 +12,7 @@ With no display available (headless/SSH), it prints the measured frame rate and
 writes a single snapshot to `frame.jpg` instead of opening a window.
 """
 
+import logging
 import sys
 import time
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import pyorbbecsdk as ob
+
+log = logging.getLogger("nexon")
 
 # The 336L color sensor's default mode. MJPG at 1280x720x30 is well-supported and
 # keeps USB bandwidth modest; cv2 decodes it straight to BGR. Set WIDTH/HEIGHT to
@@ -168,10 +171,9 @@ class OrbbecCamera:
                     and vsp.get_format() == self.color_format
                 ):
                     return vsp
-            print(
-                f"[camera: {self.width}x{self.height}@{self.fps} "
-                f"{self.color_format} unavailable — using sensor default]",
-                file=sys.stderr,
+            log.info(
+                "camera: %sx%s@%s %s unavailable — using sensor default",
+                self.width, self.height, self.fps, self.color_format,
             )
         return profiles.get_default_video_stream_profile()
 
