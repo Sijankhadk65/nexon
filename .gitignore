@@ -10,6 +10,14 @@
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+
 # Exclude virtual environments
 /.venv/
 .env
+
+# Project files
+
+/docs/
+
+# Camera capture snapshots
+/frame.jpg
