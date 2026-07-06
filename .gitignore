@@ -19,6 +19,8 @@
 
 /docs/
 
+/fairino_sdk/
+
 # Camera capture snapshots
 /frame.jpg
 /detections.jpg

@@ -1,0 +1,335 @@
+"""Fairino robot motion runtime: connect/enable + straight-line and joint moves.
+
+This is the robot's "hands" — the counterpart to vision.py's "eyes". It wraps the
+Fairino Python SDK (vendored in fairino_sdk/) with the proven connect → enable →
+clear-faults sequence and a small set of motion primitives (linear MoveL, torch-down
+IK solving, tool-frame left/right, joint MoveJ). The LangChain tools in tools.py are
+thin wrappers over these.
+
+Every public call follows the same safe pattern as the CLI it came from: connect →
+Mode(0)+RobotEnable(1)+ResetAllError() → run ONE move → CloseRPC(). No connection is
+left open, so calls are safe to repeat from the chat/voice loop.
+
+Coordinates are mm in the active work frame; angles are degrees (Fairino RPY).
+Velocity is a percentage of max, kept low by default for safety. Set NEXON_ROBOT_IP
+to point at a different controller.
+"""
+
+import logging
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+# Vendored Fairino SDK: fairino_sdk/linux/fairino/Robot.py. Add it to the path by
+# absolute location so imports work regardless of the process' working directory.
+_SDK_DIR = Path(__file__).resolve().parent / "fairino_sdk" / "linux" / "fairino"
+if str(_SDK_DIR) not in sys.path:
+    sys.path.insert(0, str(_SDK_DIR))
+import Robot  # noqa: E402 — must follow the sys.path insert above
+
+log = logging.getLogger("nexon")
+
+# --- Defaults ---
+ROBOT_IP = os.environ.get("NEXON_ROBOT_IP", "192.168.58.2")
+MOVE_VEL = 20.0  # Default speed as a percentage of max — keep low for safety.
+
+# Current commanded speed applied to EVERY move. A single mutable value that
+# set_velocity() updates and all motion primitives read, so a "go faster/slower"
+# request persists across subsequent moves. Percentage of max; clamped to a safe range.
+VEL_MIN, VEL_MAX = 1.0, 100.0
+CURRENT_VEL = MOVE_VEL
+
+
+def set_velocity(vel):
+    """Set the speed (percentage of max) used by all subsequent moves.
+
+    Clamps to [VEL_MIN, VEL_MAX] and returns the value actually stored. Only takes
+    effect while VEL_MODE == "percentage".
+    """
+    global CURRENT_VEL
+    CURRENT_VEL = float(max(VEL_MIN, min(VEL_MAX, vel)))
+    log.info("robot: velocity set to %.1f%%", CURRENT_VEL)
+    return CURRENT_VEL
+
+
+# Velocity mode: "physical" (linear moves travel at PHYSICAL_VEL mm/s — the default)
+# or "percentage" (speed is 0-100% of max). Every LINEAR move reads VEL_MODE and
+# applies the matching MoveL parameters (see _movel_speed_kwargs). Joint moves (MoveJ)
+# are angular, so mm/s has no meaning there — they always use the percentage speed
+# regardless of mode.
+VEL_MODE = "physical"
+VEL_MODES = ("percentage", "physical")
+
+# Physical linear speed / acceleration used when VEL_MODE == "physical". In the SDK's
+# physical mode (velAccParamMode=1) the real mm/s speed goes in MoveL's `ovl` and the
+# mm/s^2 acceleration in `oacc`. On this firmware `vel` AND `acc` MUST also be set to
+# 100 (full scale) or the move is rejected with err 183 — leaving them at their
+# defaults (vel=20, acc=0) is what caused the physical move to fail. See red_line_viewer
+# ._movel in the farino_app reference.
+PHYSICAL_VEL_MIN, PHYSICAL_VEL_MAX = 1.0, 250.0
+PHYSICAL_VEL = 30.0   # linear TCP speed, mm/s
+PHYSICAL_ACC = 200.0  # linear acceleration, mm/s^2 (must be > 0)
+
+
+def set_velocity_mode(mode):
+    """Switch how speed is interpreted: "percentage" (0-100% of max) or "physical" (mm/s).
+
+    Returns the mode actually stored. Raises ValueError on an unknown mode.
+    """
+    global VEL_MODE
+    if mode not in VEL_MODES:
+        raise ValueError(f"mode must be one of {VEL_MODES}, got {mode!r}")
+    VEL_MODE = mode
+    log.info("robot: velocity mode set to %s", VEL_MODE)
+    return VEL_MODE
+
+
+def set_physical_velocity(vel_mm_s):
+    """Set the linear speed (mm/s) used when VEL_MODE == "physical".
+
+    Clamps to [PHYSICAL_VEL_MIN, PHYSICAL_VEL_MAX] and returns the value stored. Only
+    takes effect for linear moves while the mode is "physical".
+    """
+    global PHYSICAL_VEL
+    PHYSICAL_VEL = float(max(PHYSICAL_VEL_MIN, min(PHYSICAL_VEL_MAX, vel_mm_s)))
+    log.info("robot: physical velocity set to %.1f mm/s", PHYSICAL_VEL)
+    return PHYSICAL_VEL
+
+
+def _movel_speed_kwargs():
+    """MoveL keyword args for the active velocity mode — checked on every linear move.
+
+    "physical" -> vel/acc pinned to 100 (full scale, required on this firmware or the
+    move errors 183) with the real speed in ovl (mm/s) and acceleration in oacc (mm/s^2);
+    "percentage" -> vel=CURRENT_VEL (0-100).
+    """
+    if VEL_MODE == "physical":
+        return {"vel": 100.0, "acc": 100.0, "ovl": PHYSICAL_VEL,
+                "oacc": PHYSICAL_ACC, "velAccParamMode": 1}
+    return {"vel": CURRENT_VEL}
+
+
+# --------------------------------------------------------------------------- #
+# Axis movement locks
+# --------------------------------------------------------------------------- #
+# Per-axis enable flags for LINEAR (Cartesian) moves. When an axis is disabled, any
+# requested motion along that base-frame axis is suppressed — its target coordinate is
+# held at the current value so the TCP cannot travel in it. Enforced by linear_move, so
+# it applies to every linear move (move_to / move_relative / move_lateral). Joint moves
+# (MoveJ) are angular and are not constrained by these Cartesian locks.
+AXIS_ENABLED = {"x": True, "y": True, "z": True}
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def set_axis_enabled(axis, enabled):
+    """Enable or disable linear movement along a base-frame axis ("x", "y", or "z").
+
+    Returns the stored flag. Raises ValueError on an unknown axis.
+    """
+    key = str(axis).lower()
+    if key not in AXIS_ENABLED:
+        raise ValueError(f"axis must be one of {tuple(AXIS_ENABLED)}, got {axis!r}")
+    AXIS_ENABLED[key] = bool(enabled)
+    log.info("robot: axis %s movement %s", key, "enabled" if AXIS_ENABLED[key] else "disabled")
+    return AXIS_ENABLED[key]
+
+
+def locked_axes():
+    """List of base-frame axes currently disabled for linear moves (e.g. ["z"])."""
+    return [ax for ax in ("x", "y", "z") if not AXIS_ENABLED[ax]]
+
+# Start / home configuration in joint angles [j1..j6] (degrees).
+START_JOINTS = [-90.0, -120.0, 85.0, -85.0, -90.0, 0.0]
+
+# Which TOOL-frame axis the torch/wire points along. Flip to +Z if the tool
+# points up instead of down.
+TORCH_AXIS = np.array([0.0, 0.0, -1.0])
+
+
+# --------------------------------------------------------------------------- #
+# Connection
+# --------------------------------------------------------------------------- #
+def connect_and_enable(ip=ROBOT_IP):
+    """Connect, enable, and clear faults. Returns (robot, tool, user).
+
+    The Mode(0)+RobotEnable(1)+ResetAllError() sequence is required before any
+    motion (otherwise MoveL/MoveJ fail with err 154), and motion must reference the
+    active TCP / work-object numbers (otherwise err 14).
+    """
+    robot = Robot.RPC(ip)
+    time.sleep(0.5)
+
+    robot.Mode(0)
+    time.sleep(0.5)
+    robot.RobotEnable(1)
+    time.sleep(1.0)
+    robot.ResetAllError()
+    time.sleep(0.5)
+
+    tool = robot.GetActualTCPNum()[1]
+    user = robot.GetActualWObjNum()[1]
+    log.info("robot: connected %s | active tool=%s user=%s", ip, tool, user)
+    return robot, tool, user
+
+
+# --------------------------------------------------------------------------- #
+# Orientation / IK helpers (torch-down solving)
+# --------------------------------------------------------------------------- #
+def _orientation_candidates():
+    """Yield (rx, ry, rz) orientations to try, tool-down first then a coarse sweep."""
+    for rz in (0.0, 90.0, 180.0, -90.0):
+        yield (180.0, 0.0, rz)
+    for rx in range(-180, 181, 90):
+        for ry in range(-90, 91, 45):
+            for rz in range(-180, 181, 90):
+                yield (float(rx), float(ry), float(rz))
+
+
+def _rpy_to_R(rpy):
+    """Fairino RPY degrees [rx, ry, rz] -> 3x3 rotation matrix (R = Rz*Ry*Rx)."""
+    rx, ry, rz = (math.radians(a) for a in rpy)
+    Rx = np.array([[1, 0, 0], [0, math.cos(rx), -math.sin(rx)], [0, math.sin(rx), math.cos(rx)]])
+    Ry = np.array([[math.cos(ry), 0, math.sin(ry)], [0, 1, 0], [-math.sin(ry), 0, math.cos(ry)]])
+    Rz = np.array([[math.cos(rz), -math.sin(rz), 0], [math.sin(rz), math.cos(rz), 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def torch_dir_in_base(rpy):
+    """Unit vector the torch points along, in the base frame, for the given RPY."""
+    return _rpy_to_R(rpy) @ TORCH_AXIS
+
+
+def solve_torch_down_rpy(robot, x, y, z, ref_joints, min_down=0.7):
+    """Return a torch-DOWN [rx, ry, rz] reachable at (x, y, z), nearest ref, or None."""
+    best = None
+    for rx, ry, rz in _orientation_candidates():
+        rpy = [float(rx), float(ry), float(rz)]
+        if torch_dir_in_base(rpy)[2] > -min_down:  # not pointing down enough
+            continue
+        err, joints = robot.GetInverseKinRef(0, [x, y, z, *rpy], ref_joints)
+        if err != 0 or joints is None:
+            continue
+        travel = sum(abs(a - b) for a, b in zip(joints, ref_joints))
+        if best is None or travel < best[0]:
+            best = (travel, rpy)
+    return None if best is None else best[1]
+
+
+# --------------------------------------------------------------------------- #
+# Motion primitives
+# --------------------------------------------------------------------------- #
+def linear_move(robot, tool, user, x, y, z, rx=None, ry=None, rz=None, dry_run=False):
+    """Straight-line MoveL to (x, y, z) in the base frame, with flexible orientation.
+
+    Pass rx/ry/rz (degrees) to reorient the tool to that RPY along the line; omit
+    them to hold the current orientation. Speed is taken from the active velocity mode
+    (percentage of max, or physical mm/s — see _movel_speed_kwargs). dry_run IK-checks
+    the target and returns 0 without moving. Returns the SDK error code (0 = success).
+    """
+    start_pose = robot.GetActualTCPPose()[1]  # [x, y, z, rx, ry, rz]
+
+    target = list(start_pose)
+    target[0], target[1], target[2] = x, y, z
+    if rx is not None:
+        target[3] = rx
+    if ry is not None:
+        target[4] = ry
+    if rz is not None:
+        target[5] = rz
+
+    # Enforce per-axis locks: hold any disabled base-frame axis at its current value so
+    # the requested motion in that axis is suppressed. Done before the IK check/move so
+    # both operate on the actual (clamped) target.
+    blocked = locked_axes()
+    for ax in blocked:
+        target[_AXIS_INDEX[ax]] = start_pose[_AXIS_INDEX[ax]]
+    if blocked:
+        log.info("robot: axis lock active %s — those axes held fixed", blocked)
+
+    speed = _movel_speed_kwargs()
+    log.info("robot: MoveL target %s | %s=%s (dry_run=%s)",
+             [round(v, 1) for v in target], VEL_MODE, speed, dry_run)
+
+    if dry_run:
+        ref = robot.GetActualJointPosDegree()[1]
+        err, joints = robot.GetInverseKinRef(0, target, ref)
+        if err != 0 or joints is None:
+            log.info("robot: DRY RUN target has NO IK solution (err %s)", err)
+            return err or -1
+        log.info("robot: DRY RUN target reachable, joints %s", [round(v, 1) for v in joints])
+        return 0
+
+    # If locks (or a zero request) leave no effective motion, skip the MoveL — commanding
+    # a zero-distance move is pointless and can be rejected by the controller.
+    if all(abs(a - b) < 1e-3 for a, b in zip(target, start_pose)):
+        log.warning("robot: no effective motion (locks %s) — skipping MoveL", blocked)
+        return 0
+
+    ret = robot.MoveL(desc_pos=target, tool=tool, user=user, **speed)
+    if ret != 0:
+        log.warning("robot: MoveL failed (err %s) — target/path unreachable or singular", ret)
+    return ret
+
+
+def linear_move_torch_down(robot, tool, user, x, y, z, dry_run=False):
+    """MoveL to (x, y, z) with an auto-solved, reachable torch-DOWN orientation.
+
+    Returns the SDK error code, or -1 if no torch-down orientation is reachable.
+    """
+    ref_joints = robot.GetActualJointPosDegree()[1]
+    rpy = solve_torch_down_rpy(robot, x, y, z, ref_joints)
+    if rpy is None:
+        log.warning("robot: no torch-DOWN orientation reachable at (%s, %s, %s)", x, y, z)
+        return -1
+    log.info("robot: torch-down RPY %s", [round(a, 1) for a in rpy])
+    return linear_move(robot, tool, user, x, y, z,
+                       rx=rpy[0], ry=rpy[1], rz=rpy[2], dry_run=dry_run)
+
+
+# Tool-frame unit directions for intuitive left/right commands. "Right" is the
+# tool's +X axis (user convention), "left" its -X. We rotate these into the base
+# frame by the CURRENT tool orientation, so left/right always mean the same
+# physical direction relative to how the tool points, regardless of its tilt.
+TOOL_DIRS = {
+    "right": np.array([1.0, 0.0, 0.0]),
+    "left": np.array([-1.0, 0.0, 0.0]),
+}
+
+
+def tool_frame_delta(rpy, direction, distance, keep_z=True):
+    """Base-frame [dx, dy, dz] to move `distance` mm along a tool-frame direction.
+
+    keep_z=True (default) keeps the move HORIZONTAL: when the tool is tilted, its
+    left/right axis points partly up/down in the base frame, which would change the
+    height. We drop the Z component and renormalize so the full `distance` is
+    travelled in the horizontal plane. Returns a zero delta if the direction is
+    (near) vertical. keep_z=False restores the raw tilted move.
+    """
+    v_base = _rpy_to_R(rpy) @ TOOL_DIRS[direction]
+    if keep_z:
+        v_base = v_base.copy()
+        v_base[2] = 0.0
+        norm = np.linalg.norm(v_base)
+        if norm < 1e-6:
+            return np.zeros(3)
+        v_base /= norm
+    return v_base * distance
+
+
+def move_tool_direction(robot, tool, user, direction, distance, dry_run=False, keep_z=True):
+    """MoveL `distance` mm in a tool-frame `direction` ("left"/"right").
+
+    Reads the current pose, resolves the direction in the tool frame, and executes a
+    straight-line base-frame move (orientation preserved). Returns the SDK error code.
+    """
+    start = robot.GetActualTCPPose()[1]
+    dx, dy, dz = tool_frame_delta(start[3:6], direction, distance, keep_z=keep_z)
+    log.info("robot: %s %s mm (tool frame) -> base delta [%.1f, %.1f, %.1f]",
+             direction, distance, dx, dy, dz)
+    return linear_move(robot, tool, user,
+                       start[0] + dx, start[1] + dy, start[2] + dz,
+                       dry_run=dry_run)
