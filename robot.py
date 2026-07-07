@@ -176,6 +176,22 @@ def connect_and_enable(ip=ROBOT_IP):
     return robot, tool, user
 
 
+def connect_readonly(ip=ROBOT_IP):
+    """Open an RPC connection for READING pose only — no enable, no fault reset.
+
+    Used by extrinsic calibration, where you jog the arm with the pendant and this
+    just reads GetActualTCPPose. Enabling here (as connect_and_enable does) would fight
+    the pendant. Warns if the active work object isn't 0, since then the TCP pose is
+    not in the base frame. Returns the raw RPC handle.
+    """
+    rob = Robot.RPC(ip)
+    time.sleep(0.5)
+    wobj = rob.GetActualWObjNum()[1]
+    if wobj != 0:
+        log.warning("robot: active WObj=%s (not 0) — TCP pose won't be base-frame; set WObj 0", wobj)
+    return rob
+
+
 # --------------------------------------------------------------------------- #
 # Orientation / IK helpers (torch-down solving)
 # --------------------------------------------------------------------------- #
@@ -290,6 +306,60 @@ def linear_move_torch_down(robot, tool, user, x, y, z, dry_run=False):
                        rx=rpy[0], ry=rpy[1], rz=rpy[2], dry_run=dry_run)
 
 
+def _nearest_single_axis_orientation(robot, x, y, z, ref_rpy, ref_joints,
+                                     step=5.0, max_deg=180.0):
+    """Find a reachable orientation at (x,y,z) that changes ONE axis of ref_rpy.
+
+    Sweeps roll, then pitch, then yaw, smallest magnitude first (so the least
+    reorientation that reaches the target wins). Returns the [rx, ry, rz] or None.
+    """
+    mag = step
+    while mag <= max_deg:
+        for axis in range(3):          # 0=roll(rx), 1=pitch(ry), 2=yaw(rz)
+            for sign in (1.0, -1.0):
+                rpy = list(ref_rpy)
+                rpy[axis] = ref_rpy[axis] + sign * mag
+                err, joints = robot.GetInverseKinRef(0, [x, y, z, *rpy], ref_joints)
+                if err == 0 and joints is not None:
+                    return rpy
+        mag += step
+    return None
+
+
+def linear_move_keep_orientation(robot, tool, user, x, y, z, dry_run=False):
+    """MoveL to (x, y, z) preferring the CURRENT tool orientation — the least-erratic path.
+
+    Strategy, in order (the movement preference):
+      1. Keep the current orientation and move in a straight line (pure translation).
+      2. If that target has no IK solution, reorient about ONE base axis at a time
+         (roll, then pitch, then yaw), smallest change first, and use the nearest
+         reachable orientation — then translate.
+
+    Position is the base-frame TCP target. Returns the SDK error code, or -1 if nothing
+    reachable was found even after single-axis reorientation.
+    """
+    start = robot.GetActualTCPPose()[1]
+    ref_rpy = list(start[3:6])
+    ref_joints = robot.GetActualJointPosDegree()[1]
+
+    # 1. Current orientation — pure translation, no reorientation.
+    err, _ = robot.GetInverseKinRef(0, [x, y, z, *ref_rpy], ref_joints)
+    if err == 0:
+        log.info("robot: keeping current orientation %s", [round(a, 1) for a in ref_rpy])
+        return linear_move(robot, tool, user, x, y, z, dry_run=dry_run)
+
+    # 2. Nearest single-axis reorientation that reaches the target.
+    rpy = _nearest_single_axis_orientation(robot, x, y, z, ref_rpy, ref_joints)
+    if rpy is None:
+        log.warning("robot: (%.0f, %.0f, %.0f) unreachable even after single-axis reorient",
+                    x, y, z)
+        return -1
+    log.info("robot: reoriented to %s (from %s) to reach target",
+             [round(a, 1) for a in rpy], [round(a, 1) for a in ref_rpy])
+    return linear_move(robot, tool, user, x, y, z,
+                       rx=rpy[0], ry=rpy[1], rz=rpy[2], dry_run=dry_run)
+
+
 # Tool-frame unit directions for intuitive left/right commands. "Right" is the
 # tool's +X axis (user convention), "left" its -X. We rotate these into the base
 # frame by the CURRENT tool orientation, so left/right always mean the same
@@ -333,3 +403,48 @@ def move_tool_direction(robot, tool, user, direction, distance, dry_run=False, k
     return linear_move(robot, tool, user,
                        start[0] + dx, start[1] + dy, start[2] + dz,
                        dry_run=dry_run)
+
+
+# --------------------------------------------------------------------------- #
+# Camera -> base extrinsic (hand-eye TF)
+# --------------------------------------------------------------------------- #
+# 4x4 transform mapping camera-frame XYZ (mm) -> robot base XYZ (mm), produced by
+# calibrate_extrinsic.py (Umeyama fit of touched base points vs. depth-deprojected
+# camera points). Loaded lazily and cached so runtime tools can turn a detected
+# pixel + depth into a base-frame target.
+EXTRINSIC_FILE = Path(__file__).resolve().parent / "T_base_cam.npy"
+_T_base_cam = None
+
+
+def load_extrinsic(path=EXTRINSIC_FILE):
+    """Load and cache the 4x4 camera->base transform. Raises FileNotFoundError if unset."""
+    global _T_base_cam
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"no extrinsic at {p} — run calibrate_extrinsic.py first")
+    _T_base_cam = np.load(p)
+    log.info("robot: loaded extrinsic %s", p.name)
+    return _T_base_cam
+
+
+def get_extrinsic():
+    """Return the cached camera->base transform, loading it on first use."""
+    if _T_base_cam is None:
+        load_extrinsic()
+    return _T_base_cam
+
+
+def cam_to_base(p_cam, T=None):
+    """Camera-frame XYZ (mm) -> base-frame XYZ (mm) via T_base_cam. Returns a length-3 array."""
+    M = get_extrinsic() if T is None else np.asarray(T)
+    return (M @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
+
+
+def pixel_to_base(u, v, z_mm, intr, T=None):
+    """Detected pixel (u,v) + its depth z_mm (mm) -> base-frame XYZ (mm).
+
+    `intr` is any object with a .deproject(u, v, z) method (camera.CameraIntrinsics):
+    pixel+depth -> camera-frame XYZ, which cam_to_base then maps into the base frame.
+    """
+    x, y, z = intr.deproject(u, v, z_mm)
+    return cam_to_base((float(x), float(y), float(z)), T)
