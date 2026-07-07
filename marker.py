@@ -41,6 +41,10 @@ MIN_AREA_PX = 20
 MIN_LINE_AREA = 60
 MIN_ELONGATION = 3.0
 
+# Default number of centerline waypoints sampled along a curved line (see
+# line_waypoints_from_mask). More = a finer trace of the curve; fewer = coarser but faster.
+LINE_WAYPOINTS = 12
+
 # A marker dot is ROUND and sits ON WHITE PAPER — these two cues reject other red
 # clutter in a welding cell (elongated red cables, a red e-stop on the dark floor).
 MIN_CIRCULARITY = 0.5   # 4*pi*A/P^2: ~1 for a disc, low for a thin cable
@@ -156,18 +160,13 @@ def find_red_marker(bgr, min_area=MIN_AREA_PX, require_on_white=True):
     return markers[0] if markers else None
 
 
-def line_endpoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION):
-    """Endpoints of the most LINE-SHAPED region in a binary mask, or None.
+def _line_shaped_contours(contours, min_area, min_elongation):
+    """All contours that qualify as a line (area + elongation), LONGEST first.
 
-    Keeps regions whose min-area-rect long/short ratio >= min_elongation (so round
-    blobs — dots, bolt holes — are rejected), picks the longest, fits a line (total
-    least squares), and returns the extreme points along it. Shared by the red-line and
-    depth seam detectors.
-
-    dict = {"p1": (u, v), "p2": (u, v), "length_px": float, "box": (x1, y1, x2, y2)}.
+    Rejects round blobs (dots, bolt holes) via the min-area-rect long/short side ratio and
+    specks via area. Shared by the single- and multi-line extractors.
     """
-    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
-    best, best_len = None, 0.0
+    kept = []
     for c in contours:
         if cv.contourArea(c) < min_area:
             continue
@@ -175,8 +174,76 @@ def line_endpoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_EL
         long_side, short_side = max(w, h), max(1.0, min(w, h))
         if long_side / short_side < min_elongation:
             continue
-        if long_side > best_len:
-            best, best_len = c, long_side
+        kept.append((long_side, c))
+    kept.sort(key=lambda t: t[0], reverse=True)
+    return [c for _, c in kept]
+
+
+def _most_line_shaped_contour(contours, min_area, min_elongation):
+    """The single longest line-shaped contour, or None."""
+    kept = _line_shaped_contours(contours, min_area, min_elongation)
+    return kept[0] if kept else None
+
+
+def _centerline_from_contour(contour, shape, num_samples):
+    """Ordered centerline polyline of one filled contour via PCA-axis binning, or None.
+
+    Projects the contour's filled pixels onto their principal axis (PCA), splits that axis
+    into `num_samples` bins, and takes the centroid of the pixels in each bin — giving
+    head->tail waypoints that follow a curve (empty bins dropped). Robust for straight and
+    gently curved lines (those that don't fold back on their principal axis).
+
+    dict = {"waypoints": [(u, v), ...] ordered, "length_px": float, "box": (x1,y1,x2,y2)}.
+    """
+    h, w = shape[:2]
+    region = np.zeros((h, w), np.uint8)
+    cv.drawContours(region, [contour], -1, 255, -1)
+    ys, xs = np.where(region > 0)
+    pts = np.column_stack([xs, ys]).astype(np.float64)      # (N, 2) as (x, y)
+
+    mean = pts.mean(axis=0)
+    evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+    axis = evecs[:, int(np.argmax(evals))]                  # principal direction (x, y)
+    t = (pts - mean) @ axis
+    order = np.argsort(t)
+    t_sorted, pts_sorted = t[order], pts[order]
+
+    edges = np.linspace(t_sorted[0], t_sorted[-1], num_samples + 1)
+    centers = []
+    for i in range(num_samples):
+        lo, hi = edges[i], edges[i + 1]
+        if i == num_samples - 1:                            # last bin includes the far edge
+            sel = (t_sorted >= lo) & (t_sorted <= hi)
+        else:
+            sel = (t_sorted >= lo) & (t_sorted < hi)
+        if sel.any():
+            centers.append(pts_sorted[sel].mean(axis=0))
+    if len(centers) < 2:
+        return None
+
+    waypoints = [(float(c[0]), float(c[1])) for c in centers]
+    length = float(sum(np.hypot(*(np.array(waypoints[i + 1]) - np.array(waypoints[i])))
+                       for i in range(len(waypoints) - 1)))
+    x, y, bw, bh = cv.boundingRect(contour)
+    return {
+        "waypoints": waypoints,
+        "length_px": length,
+        "box": (int(x), int(y), int(x + bw), int(y + bh)),
+    }
+
+
+def line_endpoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION):
+    """Endpoints of the most LINE-SHAPED region in a binary mask, or None.
+
+    Picks the most elongated region (see _most_line_shaped_contour), fits a line (total least
+    squares), and returns the extreme points along it. Shared by the red-line and depth seam
+    detectors. For a CURVED line use line_waypoints_from_mask instead — this only ever returns
+    the two extreme endpoints (a straight chord).
+
+    dict = {"p1": (u, v), "p2": (u, v), "length_px": float, "box": (x1, y1, x2, y2)}.
+    """
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    best = _most_line_shaped_contour(contours, min_area, min_elongation)
     if best is None:
         return None
 
@@ -194,9 +261,61 @@ def line_endpoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_EL
     }
 
 
+def line_waypoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION,
+                             num_samples=LINE_WAYPOINTS):
+    """Ordered CENTERLINE waypoints of the most line-shaped region, or None.
+
+    Like line_endpoints_from_mask, but returns a POLYLINE that follows a CURVED line (see
+    _centerline_from_contour) rather than just its two extreme endpoints. Picks the single
+    most-elongated region; use lines_waypoints_from_mask to get ALL lines in the mask.
+
+    dict = {"waypoints": [(u, v), ...] ordered, "length_px": float (summed segment length),
+            "box": (x1, y1, x2, y2)}.
+    """
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    best = _most_line_shaped_contour(contours, min_area, min_elongation)
+    if best is None:
+        return None
+    return _centerline_from_contour(best, mask.shape, num_samples)
+
+
+def lines_waypoints_from_mask(mask, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION,
+                              num_samples=LINE_WAYPOINTS, max_lines=None):
+    """Centerline polylines of ALL line-shaped regions in a mask, longest first; [] if none.
+
+    The multi-line form of line_waypoints_from_mask: builds a centerline for every qualifying
+    region (each a separate red mark), sorted by length. `max_lines` caps the count if given.
+    A region that can't yield >=2 centerline points is dropped. Each entry has the shape
+    documented on _centerline_from_contour.
+    """
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    kept = _line_shaped_contours(contours, min_area, min_elongation)
+    if max_lines is not None:
+        kept = kept[:max_lines]
+    out = []
+    for c in kept:
+        poly = _centerline_from_contour(c, mask.shape, num_samples)
+        if poly is not None:
+            out.append(poly)
+    return out
+
+
 def find_red_seam(bgr, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION):
     """Find the most line-shaped RED region (a red-marked seam). Returns endpoints or None."""
     return line_endpoints_from_mask(build_red_mask(bgr), min_area, min_elongation)
+
+
+def find_red_line_waypoints(bgr, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION,
+                            num_samples=LINE_WAYPOINTS):
+    """Ordered centerline waypoints of the most line-shaped RED region (follows a curve)."""
+    return line_waypoints_from_mask(build_red_mask(bgr), min_area, min_elongation, num_samples)
+
+
+def find_red_lines(bgr, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION,
+                   num_samples=LINE_WAYPOINTS, max_lines=None):
+    """Centerline polylines of ALL line-shaped RED regions (longest first); [] if none."""
+    return lines_waypoints_from_mask(build_red_mask(bgr), min_area, min_elongation,
+                                     num_samples, max_lines)
 
 
 def main():

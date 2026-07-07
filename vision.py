@@ -345,6 +345,68 @@ class VisionHub:
         }
 
 
+    def locate_red_lines(self, patch: int = 5, num_samples: int = marker.LINE_WAYPOINTS,
+                         max_lines: int | None = None) -> dict:
+        """Locate ALL RED LINES (red-marked seams/paths) as ordered 3D POLYLINES (mm).
+
+        The multi-line, color analog of locate_seam: segments EVERY line-shaped RED region in
+        the whole frame (marker.find_red_lines, no AOI) and samples each one's centerline into
+        `num_samples` ordered waypoints — so several separate red lines/tapes, straight or
+        curved, are all returned (longest first). Each waypoint gets a local depth patch and is
+        deprojected to camera-frame XYZ; waypoints over a depth hole are dropped, and a line
+        left with <2 valid points is skipped. Robot-agnostic; the caller applies the extrinsic.
+        Returns {"lines": [{"waypoints": [{"px", "cam_xyz_mm"}, ...], ...}, ...]} or an `error`.
+        """
+        self.ensure_started()
+        cap = self._latest_capture()
+        if cap is None or cap.bgr is None:
+            return {"error": "no frame captured from camera"}
+
+        found = marker.find_red_lines(cap.bgr, num_samples=num_samples, max_lines=max_lines)
+        if not found:
+            return {"error": "no red line found (need an elongated red mark — a dot won't do)"}
+
+        with self._lock:  # overlay every found line's box in the preview
+            self._dets = [Detection(label=f"red line #{i + 1}", confidence=1.0, box=s["box"])
+                          for i, s in enumerate(found)]
+
+        if cap.depth_mm is None or cap.intrinsics is None:
+            return {"error": "no depth/intrinsics available (camera not in depth mode?)"}
+
+        lines = []
+        for s in found:
+            waypoints = []
+            for (u, v) in s["waypoints"]:
+                z = _depth_at(cap.depth_mm, int(round(u)), int(round(v)), patch, s["box"])
+                if z <= 0:
+                    continue  # skip waypoints over a depth hole; keep the rest of this line
+                x, y, zc = cap.intrinsics.deproject(u, v, z)
+                waypoints.append({"px": [round(u, 1), round(v, 1)],
+                                  "cam_xyz_mm": [float(x), float(y), float(zc)]})
+            if len(waypoints) < 2:
+                continue  # this line had too few points with depth — drop it
+            lines.append({
+                "waypoints": waypoints,
+                "length_px": round(s["length_px"], 1),
+                "num_sampled": len(s["waypoints"]),
+                "num_with_depth": len(waypoints),
+            })
+        if not lines:
+            return {"error": "red line(s) found but none had enough depth (holes) — reposition"}
+        return {"lines": lines, "num_detected": len(found)}
+
+    def locate_red_line(self, patch: int = 5,
+                        num_samples: int = marker.LINE_WAYPOINTS) -> dict:
+        """Locate the single most prominent RED line as an ordered 3D polyline. See locate_red_lines.
+
+        Thin wrapper returning the longest line's `waypoints` dict, or an `error`. Kept for
+        callers that only act on one line (detect_red_line).
+        """
+        res = self.locate_red_lines(patch, num_samples, max_lines=1)
+        if "error" in res:
+            return res
+        return res["lines"][0]
+
     def frame_size(self):
         """(width, height) of the current camera frame in pixels, or None if unavailable."""
         self.ensure_started()

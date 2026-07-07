@@ -23,6 +23,11 @@ Two families:
     color segmentation (marker.py) to see and go to red dot(s)/marker(s) — the neural
     detector can't see a small color blob, so anything red goes through these, not
     detect_objects. move_to_red_marker visits every marker in view, nearest first.
+  - red line (`detect_red_line`, `detect_red_lines`, `follow_red_line`): the color analog of
+    the seam tools — segments line-shaped RED region(s) (marker.py, no AOI), samples each
+    centerline into ordered waypoints, and traces the CURVE (hover -> descend -> traverse each
+    waypoint -> retract). detect_red_lines lists every line; follow_red_line traces them all
+    along a greedy nearest route. Use for drawn red line(s) / red tape, straight or curved.
   - seam (`set_seam_aoi`, `detect_seam`, `follow_seam`): set the scan region (AOI) in pixels,
     then geometrically detect a bare-metal seam (the joint
     between two parts) in the DEPTH map within a configured AOI (seam.py), map both endpoints
@@ -469,6 +474,56 @@ def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta):
     return json.dumps(result)
 
 
+def _trace_polyline_base(points, hover_mm, dry_run, meta):
+    """Trace an ordered polyline of base-frame points: hover->descend->traverse each->retract.
+
+    Shared by follow_seam and follow_red_line. `points` is an ordered list of length-3
+    base-frame XYZ (mm), head->tail (>=2; a straight line is just two). Approaches above the
+    first point, descends to it, does a straight MoveL to every subsequent point in turn
+    (following a curve as a chain of short segments), then retracts above the last. Keeps the
+    current tool orientation (reorienting one axis only on the approach if it's unreachable).
+    MOTION ONLY — never fires an arc/weld output. Returns a JSON string (with `meta` merged in).
+    """
+    pts = [[float(p[0]), float(p[1]), float(p[2])] for p in points]
+    first, last = pts[0], pts[-1]
+    waypoints = [("hover_p1", first[0], first[1], first[2] + hover_mm),
+                 ("descend_p1", first[0], first[1], first[2])]
+    for i, p in enumerate(pts[1:], start=1):
+        waypoints.append((f"traverse_{i}", p[0], p[1], p[2]))
+    waypoints.append(("retract", last[0], last[1], last[2] + hover_mm))
+    length = float(sum(np.linalg.norm(np.array(pts[i + 1]) - np.array(pts[i]))
+                       for i in range(len(pts) - 1)))
+    result = dict(meta)
+    result.update({
+        "p1_base_mm": [round(v, 1) for v in first],
+        "p2_base_mm": [round(v, 1) for v in last],
+        "num_waypoints": len(pts),
+        "length_mm": round(length, 1),
+        "hover_mm": hover_mm, "dry_run": dry_run, "motion_only": True, "steps": [],
+    })
+    try:
+        rob, tool, user = robot.connect_and_enable()
+        ok = True
+        for i, (label, x, y, z) in enumerate(waypoints):
+            if i == 0:  # first waypoint may reorient a single axis if unreachable
+                ret = robot.linear_move_keep_orientation(rob, tool, user, x, y, z, dry_run=dry_run)
+            else:       # rest are pure translations along the line, orientation held
+                ret = robot.linear_move(rob, tool, user, x, y, z, dry_run=dry_run)
+            result["steps"].append({"step": label,
+                                    "target_mm": [round(x, 1), round(y, 1), round(z, 1)],
+                                    "result": ret, "success": ret == 0})
+            if ret != 0:
+                ok = False
+                break
+        result["success"] = ok
+        if not dry_run:
+            result["final_pose"] = [round(v, 1) for v in rob.GetActualTCPPose()[1]]
+        rob.CloseRPC()
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"robot unavailable: {exc}"})
+    return json.dumps(result)
+
+
 @tool(parse_docstring=True)
 def find_red_marker() -> str:
     """Look for a RED marker (e.g. a red dot on paper) via color. Read-only, never moves.
@@ -572,6 +627,47 @@ def _order_markers_greedy_nearest(markers):
     return ordered + holes
 
 
+def _order_lines_greedy_nearest(lines):
+    """Greedy nearest-neighbour ROUTE over multiple base-frame polylines, entering each from
+    its nearer end.
+
+    `lines` is a list of ordered base-frame point lists (each length-3 XYZ). Starting at the
+    live tool position, repeatedly pick the line whose closest endpoint is nearest, orient it
+    so the tool ENTERS at that endpoint (reversing the polyline if the far end is closer),
+    trace to the other end, then continue from there. Returns the reordered, possibly-reversed
+    polylines (as plain float lists). Falls back to the input order (longest first, unflipped)
+    if the TCP pose can't be read.
+    """
+    pts_lists = [[[float(c) for c in p] for p in ln] for ln in lines]
+    if len(pts_lists) <= 1:
+        return pts_lists
+    try:
+        rob = robot.connect_readonly()
+        try:
+            tcp = rob.GetActualTCPPose()[1]
+        finally:
+            rob.CloseRPC()
+        cur = [float(tcp[0]), float(tcp[1]), float(tcp[2])]
+    except Exception:  # noqa: BLE001 — robot unavailable: keep longest-first, unflipped
+        return pts_lists
+
+    def d2(a, b):
+        return sum((a[i] - b[i]) ** 2 for i in range(3))
+
+    remaining = set(range(len(pts_lists)))
+    ordered = []
+    while remaining:
+        # pick the line whose nearer endpoint is closest to the current tool position
+        k = min(remaining, key=lambda k: min(d2(cur, pts_lists[k][0]), d2(cur, pts_lists[k][-1])))
+        pts = pts_lists[k]
+        if d2(cur, pts[-1]) < d2(cur, pts[0]):  # far end is closer -> enter from the tail
+            pts = pts[::-1]
+        ordered.append(pts)
+        remaining.discard(k)
+        cur = pts[-1]  # advance to this line's exit endpoint
+    return ordered
+
+
 @tool(parse_docstring=True)
 def move_to_red_marker(
     hover_mm: float = 100.0,
@@ -632,6 +728,134 @@ def move_to_red_marker(
     }
     if stopped:
         out["note"] = "stopped early: a marker's hover failed (see its visit entry)"
+    return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def detect_red_line(num_samples: int = 12) -> str:
+    """Find a RED LINE (a red-marked seam/path) by color and report its waypoints. Read-only.
+
+    The color analog of detect_seam: segments the most line-shaped RED region in the frame —
+    no AOI needed, the same color cue as find_red_marker but for an ELONGATED mark (red tape
+    or a drawn red line, not a dot) — and samples its centerline into up to `num_samples`
+    ordered waypoints, so a CURVED line is captured, not just its endpoints. Returns the
+    waypoints as pixels and, if the camera is calibrated (T_base_cam.npy), as base-frame XYZ
+    with the line's traced 3D length. Use this to see the red path before follow_red_line.
+
+    Args:
+        num_samples: How many centerline points to sample along the line (default 12; more = finer curve).
+    """
+    try:
+        loc = vision.get_hub().locate_red_line(num_samples=num_samples)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"vision unavailable: {exc}"})
+    if "error" in loc:
+        return json.dumps({"found": False, **loc})
+    wps = loc["waypoints"]
+    out = {"found": True, "num_waypoints": len(wps), "length_px": loc["length_px"],
+           "waypoints_px": [w["px"] for w in wps]}
+    try:
+        base = [robot.cam_to_base(w["cam_xyz_mm"]) for w in wps]
+        out["waypoints_base_mm"] = [[round(float(v), 1) for v in b] for b in base]
+        out["length_mm"] = round(float(sum(np.linalg.norm(base[i + 1] - base[i])
+                                            for i in range(len(base) - 1))), 1)
+    except FileNotFoundError:
+        out["note"] = "camera not calibrated (no T_base_cam.npy) — pixels only"
+    return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def detect_red_lines(num_samples: int = 12) -> str:
+    """Find ALL RED LINES by color and report each one's waypoints. Read-only, never moves.
+
+    Like detect_red_line but reports EVERY red line in view (longest first), not just one — use
+    this when the user asks how many red lines/paths there are, or to list them before tracing
+    with follow_red_line. Each line's centerline is sampled into up to `num_samples` ordered
+    waypoints (so curves are captured). Returns the count and, per line, its waypoints as pixels
+    and — if calibrated (T_base_cam.npy) — as base-frame XYZ with the line's traced 3D length.
+
+    Args:
+        num_samples: How many centerline points to sample along each line (default 12; more = finer curve).
+    """
+    try:
+        res = vision.get_hub().locate_red_lines(num_samples=num_samples)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"vision unavailable: {exc}"})
+    if "error" in res:
+        return json.dumps({"found": False, "count": 0, **res})
+
+    calibrated = True
+    lines = []
+    for ln in res["lines"]:
+        wps = ln["waypoints"]
+        entry = {"num_waypoints": len(wps), "length_px": ln["length_px"],
+                 "waypoints_px": [w["px"] for w in wps]}
+        try:
+            base = [robot.cam_to_base(w["cam_xyz_mm"]) for w in wps]
+            entry["waypoints_base_mm"] = [[round(float(v), 1) for v in b] for b in base]
+            entry["length_mm"] = round(float(sum(np.linalg.norm(base[i + 1] - base[i])
+                                                 for i in range(len(base) - 1))), 1)
+        except FileNotFoundError:
+            calibrated = False
+        lines.append(entry)
+
+    out = {"found": True, "count": len(lines), "lines": lines}
+    if not calibrated:
+        out["note"] = "camera not calibrated (no T_base_cam.npy) — pixels only"
+    return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def follow_red_line(hover_mm: float = 60.0, num_samples: int = 12, dry_run: bool = False) -> str:
+    """Trace EVERY red line in view, one after another — MOTION ONLY, never fires an arc/weld.
+
+    The color analog of follow_seam, but handles MULTIPLE curved lines: locates all red lines
+    by color (see detect_red_lines), samples each one's centerline into ordered waypoints, maps
+    them to the base frame, then traces the lines along a greedy nearest-neighbour route —
+    entering each line at whichever endpoint is closer. Per line it runs: hover above the entry
+    point -> descend -> straight MoveL through every waypoint (tracing the curve) -> retract
+    above the exit. Traverse speed follows the current velocity/mode (use physical mm/s for a
+    real travel speed). Keeps the current tool orientation (reorienting one axis only if an
+    approach is unreachable); axis locks apply. Does NOT weld. Requires a saved extrinsic. If
+    only one line is in view this simply traces it.
+
+    ALWAYS prefer dry_run=True first: it IK-checks every waypoint of every line without moving.
+    On a real run the sequence stops at the first line whose trace fails.
+
+    Args:
+        hover_mm: Approach/retract height above each line's endpoints, in mm (default 60).
+        num_samples: How many centerline points to trace along each line (default 12; more = finer curve).
+        dry_run: If true, IK-check all waypoints without moving the arm.
+    """
+    try:
+        res = vision.get_hub().locate_red_lines(num_samples=num_samples)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"vision unavailable: {exc}"})
+    if "error" in res:
+        return json.dumps(res)
+    try:
+        lines = [[robot.cam_to_base(w["cam_xyz_mm"]) for w in ln["waypoints"]]
+                 for ln in res["lines"]]
+    except FileNotFoundError as exc:
+        return json.dumps({"error": str(exc)})
+
+    ordered = _order_lines_greedy_nearest(lines)
+    traces = []
+    stopped = False
+    for i, pts in enumerate(ordered):
+        trace = json.loads(_trace_polyline_base(pts, hover_mm, dry_run,
+                                                {"line": "red", "line_index": i + 1}))
+        traces.append(trace)
+        # On a real run, halt if a line's trace errors or IK-fails — don't keep commanding
+        # motion after a failure. In dry_run, check every line regardless.
+        if not dry_run and ("error" in trace or not trace.get("success")):
+            stopped = True
+            break
+
+    out = {"line": "red", "count": len(lines), "traced": len(traces),
+           "dry_run": dry_run, "traces": traces}
+    if stopped:
+        out["note"] = "stopped early: a line's trace failed (see its entry)"
     return json.dumps(out)
 
 
@@ -737,41 +961,7 @@ def follow_seam(hover_mm: float = 60.0, dry_run: bool = False) -> str:
         b2 = robot.cam_to_base(loc["p2_cam_xyz_mm"])
     except FileNotFoundError as exc:
         return json.dumps({"error": str(exc)})
-    p1 = [float(b1[0]), float(b1[1]), float(b1[2])]
-    p2 = [float(b2[0]), float(b2[1]), float(b2[2])]
-    waypoints = [
-        ("hover_p1", p1[0], p1[1], p1[2] + hover_mm),
-        ("descend_p1", p1[0], p1[1], p1[2]),
-        ("traverse_p2", p2[0], p2[1], p2[2]),
-        ("retract_p2", p2[0], p2[1], p2[2] + hover_mm),
-    ]
-    result = {
-        "p1_base_mm": [round(v, 1) for v in p1],
-        "p2_base_mm": [round(v, 1) for v in p2],
-        "length_mm": round(float(np.linalg.norm(b2 - b1)), 1),
-        "hover_mm": hover_mm, "dry_run": dry_run, "motion_only": True, "steps": [],
-    }
-    try:
-        rob, tool, user = robot.connect_and_enable()
-        ok = True
-        for i, (label, x, y, z) in enumerate(waypoints):
-            if i == 0:  # first waypoint may reorient a single axis if unreachable
-                ret = robot.linear_move_keep_orientation(rob, tool, user, x, y, z, dry_run=dry_run)
-            else:       # rest are pure translations along the seam, orientation held
-                ret = robot.linear_move(rob, tool, user, x, y, z, dry_run=dry_run)
-            result["steps"].append({"step": label,
-                                    "target_mm": [round(x, 1), round(y, 1), round(z, 1)],
-                                    "result": ret, "success": ret == 0})
-            if ret != 0:
-                ok = False
-                break
-        result["success"] = ok
-        if not dry_run:
-            result["final_pose"] = [round(v, 1) for v in rob.GetActualTCPPose()[1]]
-        rob.CloseRPC()
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"robot unavailable: {exc}"})
-    return json.dumps(result)
+    return _trace_polyline_base([b1, b2], hover_mm, dry_run, {})
 
 
 # All tools exposed to the orchestrator. Add future robot tools here.
@@ -779,6 +969,8 @@ ALL_TOOLS = [
     detect_objects,
     find_red_marker,
     find_red_markers,
+    detect_red_line,
+    detect_red_lines,
     set_seam_aoi,
     detect_seam,
     get_robot_pose,
@@ -794,6 +986,7 @@ ALL_TOOLS = [
     robot_move_joints,
     move_to_detection,
     move_to_red_marker,
+    follow_red_line,
     follow_seam,
 ]
 
