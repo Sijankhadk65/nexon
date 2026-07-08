@@ -45,11 +45,14 @@ MIN_ELONGATION = 3.0
 # line_waypoints_from_mask). More = a finer trace of the curve; fewer = coarser but faster.
 LINE_WAYPOINTS = 12
 
-# A marker dot is ROUND and sits ON WHITE PAPER — these two cues reject other red
-# clutter in a welding cell (elongated red cables, a red e-stop on the dark floor).
+# A marker dot is ROUND and sits on a BRIGHT surface (white paper, light wood, a clean
+# plate) — these two cues reject other red clutter in a welding cell (elongated red cables,
+# a red e-stop on the dark floor). "Bright surface" is deliberately looser than "white": a
+# marker on tan wood has a bright but SATURATED ring, which a white-only test wrongly rejects.
 MIN_CIRCULARITY = 0.5   # 4*pi*A/P^2: ~1 for a disc, low for a thin cable
-MIN_WHITE_FRAC = 0.5    # fraction of the ring around the blob that must be white
-WHITE_RING_PX = 12      # thickness of that surrounding ring (px)
+MIN_LIGHT_FRAC = 0.5    # fraction of the ring around the blob that must be a bright background
+LIGHT_V_MIN = 150       # HSV value above which a ring pixel counts as "bright" (wood/paper/plate)
+LIGHT_RING_PX = 12      # thickness of that surrounding ring (px)
 
 
 def build_red_mask(bgr):
@@ -76,29 +79,31 @@ def _circularity(contour, area):
     return 4.0 * np.pi * area / (perim * perim) if perim > 0 else 0.0
 
 
-def _on_white_fraction(bgr, contour):
-    """Fraction of the ring just OUTSIDE the blob that is white (bright, low-saturation).
+def _on_light_fraction(bgr, contour):
+    """Fraction of the ring just OUTSIDE the blob that is a BRIGHT background (high value).
 
-    A marker dot on paper is surrounded by white; a red e-stop on the dark floor is not.
+    A marker dot on paper/wood/a clean plate is surrounded by a bright surface; a red e-stop
+    on the dark floor is not. Uses brightness only (not "white"), so a bright but saturated
+    surface like tan wood still counts.
     """
     h, w = bgr.shape[:2]
     blob = np.zeros((h, w), np.uint8)
     cv.drawContours(blob, [contour], -1, 255, -1)
-    k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (WHITE_RING_PX * 2 + 1,) * 2)
+    k = cv.getStructuringElement(cv.MORPH_ELLIPSE, (LIGHT_RING_PX * 2 + 1,) * 2)
     ring = cv.dilate(blob, k) & cv.bitwise_not(blob)
     idx = ring > 0
     if idx.sum() < 10:
         return 0.0
-    hsv = cv.cvtColor(bgr, cv.COLOR_BGR2HSV)
-    white = (hsv[:, :, 2] > 180) & (hsv[:, :, 1] < 60)
-    return float(white[idx].sum()) / float(idx.sum())
+    v = cv.cvtColor(bgr, cv.COLOR_BGR2HSV)[:, :, 2]
+    light = v > LIGHT_V_MIN
+    return float(light[idx].sum()) / float(idx.sum())
 
 
-def _marker_from_contour(contour, area, white_frac):
+def _marker_from_contour(contour, area, light_frac):
     """Build a marker dict from an accepted contour, or None if it has no mass.
 
     dict = {"center": (u, v) float sub-pixel centroid, "area_px": int,
-            "radius_px": float, "box": (x1, y1, x2, y2), "on_white": float}.
+            "radius_px": float, "box": (x1, y1, x2, y2), "on_light": float}.
     """
     M = cv.moments(contour)
     if M["m00"] == 0:
@@ -112,17 +117,18 @@ def _marker_from_contour(contour, area, white_frac):
         "area_px": int(area),
         "radius_px": float(radius),
         "box": (int(x), int(y), int(x + w), int(y + hh)),
-        "on_white": round(float(white_frac), 2),
+        "on_light": round(float(light_frac), 2),
     }
 
 
-def find_red_markers(bgr, min_area=MIN_AREA_PX, require_on_white=True, max_markers=None):
+def find_red_markers(bgr, min_area=MIN_AREA_PX, require_on_light=True, max_markers=None):
     """Locate ALL red marker DOTS. Returns a list of dicts (largest first); [] if none.
 
     Keeps every red blob that is (a) big enough, (b) round (circularity >= MIN_CIRCULARITY,
-    rejecting elongated red cables) and, if `require_on_white`, (c) surrounded by white
-    (rejecting a red e-stop / red clutter that isn't on paper). Unlike find_red_marker,
-    this returns every survivor — so multiple identical markers in view are all reported.
+    rejecting elongated red cables) and, if `require_on_light`, (c) on a BRIGHT background —
+    white paper, light wood, or a clean plate (rejecting a red e-stop / red clutter on the
+    dark floor). Set require_on_light=False to accept a red dot on a dark surface too. Unlike
+    find_red_marker, this returns every survivor, so multiple markers in view are all reported.
     Results are sorted by area (largest first); `max_markers` caps the count if given.
 
     Each dict has the shape documented on _marker_from_contour.
@@ -137,10 +143,10 @@ def find_red_markers(bgr, min_area=MIN_AREA_PX, require_on_white=True, max_marke
             continue
         if _circularity(c, area) < MIN_CIRCULARITY:
             continue
-        white_frac = _on_white_fraction(bgr, c) if require_on_white else 1.0
-        if require_on_white and white_frac < MIN_WHITE_FRAC:
+        light_frac = _on_light_fraction(bgr, c) if require_on_light else 1.0
+        if require_on_light and light_frac < MIN_LIGHT_FRAC:
             continue
-        m = _marker_from_contour(c, area, white_frac)
+        m = _marker_from_contour(c, area, light_frac)
         if m is not None:
             markers.append(m)
 
@@ -150,13 +156,13 @@ def find_red_markers(bgr, min_area=MIN_AREA_PX, require_on_white=True, max_marke
     return markers
 
 
-def find_red_marker(bgr, min_area=MIN_AREA_PX, require_on_white=True):
+def find_red_marker(bgr, min_area=MIN_AREA_PX, require_on_light=True):
     """Locate the single most prominent red marker DOT. Returns a dict, or None.
 
     Thin wrapper over find_red_markers that returns the largest survivor (same acceptance
     rules). Kept for callers that only want one marker; use find_red_markers to get all.
     """
-    markers = find_red_markers(bgr, min_area, require_on_white, max_markers=1)
+    markers = find_red_markers(bgr, min_area, require_on_light, max_markers=1)
     return markers[0] if markers else None
 
 

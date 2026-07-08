@@ -58,7 +58,8 @@ BASE_SYSTEM_PROMPT = (
     "only, never welds. "
     "You can also move the arm: get_robot_pose reads its current position; "
     "robot_move_to goes to an absolute X/Y/Z (mm); robot_move_relative nudges by an "
-    "offset; robot_move_lateral moves left/right relative to the tool; robot_move_joints "
+    "offset; robot_move_direction moves left/right (base X) or forward/back (base Y) — "
+    "right=+X, forward=+Y; robot_move_joints "
     "sets joint angles; and robot_go_home parks it. move_to_detection finds an object "
     "with the camera and moves the tool over its real 3D position (via the calibrated "
     "camera-to-base transform) — use it for 'go to'/'move to' the thing you see. All moves run at a single shared "
@@ -212,17 +213,56 @@ def run_agent_turn(agent, messages, tools_by_name, speaker, speaking, machine,
     return True
 
 
+def _el_detail(exc) -> str:
+    """Compact ElevenLabs ApiError summary (status + code); falls back to repr."""
+    body = getattr(exc, "body", None)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        return f"{getattr(exc, 'status_code', '?')} {detail.get('status') or detail.get('code')}"
+    return repr(exc)
+
+
+def _el_voice_not_found(exc) -> bool:
+    """True only if the error means the voice id itself doesn't exist (vs a permission/other error)."""
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    body = getattr(exc, "body", None)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        return "voice_not_found" in (detail.get("status"), detail.get("code"))
+    return False
+
+
 def resolve_voice_id(client: ElevenLabs) -> str | None:
-    """Pick a voice: env override, else the first voice on the account."""
+    """Pick a voice: a set ELEVENLABS_VOICE_ID (trusted), else the first voice on the account.
+
+    A set voice id is TRUSTED unless we can prove it's wrong: we try to fetch it but only
+    OVERRIDE it when the voice genuinely doesn't exist (404). If validation simply can't run —
+    e.g. the key lacks the 'voices_read' permission — we keep the env voice, because the actual
+    TTS (text_to_speech) only needs the 'text_to_speech' permission and may still work. Only
+    when no voice id is given do we list account voices (which does require 'voices_read').
+    """
     env_voice = os.environ.get("ELEVENLABS_VOICE_ID")
     if env_voice:
-        return env_voice
+        try:
+            client.voices.get(env_voice)
+            return env_voice
+        except Exception as exc:  # noqa: BLE001
+            if _el_voice_not_found(exc):
+                print(f"[tts: ELEVENLABS_VOICE_ID '{env_voice}' does not exist on this account; "
+                      f"falling back to an available voice]", file=sys.stderr)
+            else:  # couldn't validate (e.g. key missing 'voices_read') — trust it, TTS may still work
+                print(f"[tts: could not validate ELEVENLABS_VOICE_ID ({_el_detail(exc)}); "
+                      f"using it anyway — grant the key 'voices_read' to silence this]",
+                      file=sys.stderr)
+                return env_voice
     try:
         voices = client.voices.get_all().voices
         if voices:
             return voices[0].voice_id
     except Exception as exc:  # noqa: BLE001
-        print(f"[tts: could not list voices: {exc}]", file=sys.stderr)
+        print(f"[tts: could not list voices ({_el_detail(exc)}) — grant the key 'voices_read', "
+              f"or set ELEVENLABS_VOICE_ID]", file=sys.stderr)
     return None
 
 
@@ -426,6 +466,7 @@ def main():
         voice_id = resolve_voice_id(el)
         if voice_id:
             speaker = Speaker(el, voice_id)
+            log.info("tts: using voice %s", voice_id)
         else:
             log.warning("tts: no voice available (set ELEVENLABS_VOICE_ID); text-only")
     else:

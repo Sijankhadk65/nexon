@@ -6,7 +6,7 @@ Two families:
     open-vocabulary detector, optionally measuring real-world size from the depth
     sensor. The camera/detector/preview are owned by the shared VisionHub (vision.py).
   - motion (`get_robot_pose`, `robot_go_home`, `robot_move_to`, `robot_move_relative`,
-    `robot_move_lateral`, `robot_move_joints`): drives the Fairino arm via robot.py.
+    `robot_move_direction`, `robot_move_joints`): drives the Fairino arm via robot.py.
     Each opens a fresh connection, runs one move, and closes it — safe to repeat.
   - speed (`get_velocity_mode`, `set_robot_velocity`, `set_velocity_mode`,
     `set_physical_velocity`): a single shared velocity in robot.py that every move reads,
@@ -195,9 +195,10 @@ def robot_move_relative(
 ) -> str:
     """Move the arm in a straight line (MoveL) relative to where it is now, by dx/dy/dz (mm).
 
-    Use this for "move up 20 mm", "back 50 mm", etc. Orientation is preserved, and the
-    move runs at the current velocity (set with set_robot_velocity). For "move
-    left/right" prefer robot_move_lateral, which respects the tool's tilt.
+    Use this for "move up 20 mm" or an explicit axis offset. Orientation is preserved, and
+    the move runs at the current velocity (set with set_robot_velocity). For "move
+    left/right/forward/back" prefer robot_move_direction, which maps those words to the
+    fixed base axes (right=+X, forward=+Y).
 
     Args:
         dx: Offset along base X in mm (default 0).
@@ -222,35 +223,35 @@ def robot_move_relative(
 
 
 @tool(parse_docstring=True)
-def robot_move_lateral(
+def robot_move_direction(
     direction: str,
     distance_mm: float,
-    keep_z: bool = True,
     dry_run: bool = False,
 ) -> str:
-    """Move the arm left or right relative to the TOOL, in a straight line (MoveL).
+    """Move the arm left/right/forward/back along the fixed BASE axes, straight (MoveL).
 
-    USE THIS for any "move left" / "move right" request. "Right" is the tool's +X
-    axis, "left" its -X, resolved in the current tool frame (so it tracks the tool's
-    tilt) and executed as a base-frame straight line with orientation preserved — you
-    do not need to work out which base axis is "right". Runs at the current velocity
-    (set with set_robot_velocity).
+    USE THIS for any "move left/right" or "move forward/back (front/behind)" request. The
+    mapping is fixed in the robot base frame, matching the operator's convention:
+      right = +X, left = -X, forward/front = +Y, back/backward = -Y.
+    Left/right move along base X, front/back along base Y; height (Z) is never changed. The
+    move is a straight base-frame line with orientation preserved, at the current velocity
+    (set with set_robot_velocity). For up/down or an explicit axis offset use
+    robot_move_relative.
 
     Args:
-        direction: "left" or "right".
+        direction: "left", "right", "forward" (or "front"), or "back" (or "backward").
         distance_mm: How far to travel, in mm.
-        keep_z: If true (default) keep the move horizontal (height unchanged) even
-            when the tool is tilted. Set false to follow the tool's tilt (may change Z).
         dry_run: If true, IK-check the destination without moving.
     """
-    if direction not in robot.TOOL_DIRS:
-        return json.dumps({"error": f"direction must be 'left' or 'right', got {direction!r}"})
+    if str(direction).lower() not in robot.BASE_DIRS:
+        return json.dumps({"error": f"direction must be one of "
+                           f"{sorted(robot.BASE_DIRS)}, got {direction!r}"})
     try:
         rob, tool, user = robot.connect_and_enable()
         start = rob.GetActualTCPPose()[1]
-        ret = robot.move_tool_direction(rob, tool, user, direction, distance_mm,
-                                        dry_run=dry_run, keep_z=keep_z)
-        result = {"direction": direction, "distance_mm": distance_mm, "keep_z": keep_z,
+        ret = robot.move_base_direction(rob, tool, user, direction, distance_mm,
+                                        dry_run=dry_run)
+        result = {"direction": direction, "distance_mm": distance_mm,
                   "dry_run": dry_run, "result": ret, "success": ret == 0,
                   "start_pose": [round(v, 1) for v in start],
                   "locked_axes": robot.locked_axes()}
@@ -362,7 +363,7 @@ def set_physical_velocity(velocity_mm_s: float) -> str:
 
     Use this when the user asks for a real travel speed ("move at 30 mm/s"). The value
     persists and applies to linear moves (robot_move_to, robot_move_relative,
-    robot_move_lateral) while the velocity mode is "physical" — call
+    robot_move_direction) while the velocity mode is "physical" — call
     set_velocity_mode("physical") to actually use it. It does not move the arm by itself.
 
     Args:
@@ -383,7 +384,7 @@ def set_axis_movement(axis: str, enabled: bool) -> str:
     Use this to restrict motion to certain axes: set enabled=False to prevent the tool
     from moving along an axis ("don't move in Z", "lock the X axis"), or enabled=True to
     allow it again. The flag persists and is checked on every linear move (robot_move_to,
-    robot_move_relative, robot_move_lateral) — any requested motion along a locked axis is
+    robot_move_relative, robot_move_direction) — any requested motion along a locked axis is
     suppressed, holding that coordinate fixed while the other axes still move. Joint moves
     (robot_move_joints, robot_go_home) are angular and are NOT affected. Does not move the
     arm by itself.
@@ -982,7 +983,7 @@ ALL_TOOLS = [
     robot_go_home,
     robot_move_to,
     robot_move_relative,
-    robot_move_lateral,
+    robot_move_direction,
     robot_move_joints,
     move_to_detection,
     move_to_red_marker,

@@ -360,46 +360,34 @@ def linear_move_keep_orientation(robot, tool, user, x, y, z, dry_run=False):
                        rx=rpy[0], ry=rpy[1], rz=rpy[2], dry_run=dry_run)
 
 
-# Tool-frame unit directions for intuitive left/right commands. "Right" is the
-# tool's +X axis (user convention), "left" its -X. We rotate these into the base
-# frame by the CURRENT tool orientation, so left/right always mean the same
-# physical direction relative to how the tool points, regardless of its tilt.
-TOOL_DIRS = {
-    "right": np.array([1.0, 0.0, 0.0]),
-    "left": np.array([-1.0, 0.0, 0.0]),
+# Fixed BASE-frame directions for intuitive operator commands. These do NOT depend on the
+# tool's orientation: left/right run along base X, front/back along base Y — so they match
+# the operator's convention (right=+X, left=-X, forward/front=+Y, back=-Y) regardless of how
+# the tool is tilted. Base X/Y moves are horizontal, so height (Z) is never changed.
+BASE_DIRS = {
+    "right":    np.array([1.0, 0.0, 0.0]),
+    "left":     np.array([-1.0, 0.0, 0.0]),
+    "forward":  np.array([0.0, 1.0, 0.0]),
+    "front":    np.array([0.0, 1.0, 0.0]),
+    "back":     np.array([0.0, -1.0, 0.0]),
+    "backward": np.array([0.0, -1.0, 0.0]),
 }
 
 
-def tool_frame_delta(rpy, direction, distance, keep_z=True):
-    """Base-frame [dx, dy, dz] to move `distance` mm along a tool-frame direction.
+def move_base_direction(robot, tool, user, direction, distance, dry_run=False):
+    """MoveL `distance` mm along a fixed BASE-frame `direction`.
 
-    keep_z=True (default) keeps the move HORIZONTAL: when the tool is tilted, its
-    left/right axis points partly up/down in the base frame, which would change the
-    height. We drop the Z component and renormalize so the full `distance` is
-    travelled in the horizontal plane. Returns a zero delta if the direction is
-    (near) vertical. keep_z=False restores the raw tilted move.
+    right=+X, left=-X, forward/front=+Y, back/backward=-Y. Straight-line base-frame move with
+    orientation preserved (height unchanged). Returns the SDK error code. Raises ValueError on
+    an unknown direction.
     """
-    v_base = _rpy_to_R(rpy) @ TOOL_DIRS[direction]
-    if keep_z:
-        v_base = v_base.copy()
-        v_base[2] = 0.0
-        norm = np.linalg.norm(v_base)
-        if norm < 1e-6:
-            return np.zeros(3)
-        v_base /= norm
-    return v_base * distance
-
-
-def move_tool_direction(robot, tool, user, direction, distance, dry_run=False, keep_z=True):
-    """MoveL `distance` mm in a tool-frame `direction` ("left"/"right").
-
-    Reads the current pose, resolves the direction in the tool frame, and executes a
-    straight-line base-frame move (orientation preserved). Returns the SDK error code.
-    """
+    key = str(direction).lower()
+    if key not in BASE_DIRS:
+        raise ValueError(f"direction must be one of {sorted(BASE_DIRS)}, got {direction!r}")
     start = robot.GetActualTCPPose()[1]
-    dx, dy, dz = tool_frame_delta(start[3:6], direction, distance, keep_z=keep_z)
-    log.info("robot: %s %s mm (tool frame) -> base delta [%.1f, %.1f, %.1f]",
-             direction, distance, dx, dy, dz)
+    dx, dy, dz = BASE_DIRS[key] * distance
+    log.info("robot: %s %s mm (base frame) -> delta [%.1f, %.1f, %.1f]",
+             key, distance, dx, dy, dz)
     return linear_move(robot, tool, user,
                        start[0] + dx, start[1] + dy, start[2] + dz,
                        dry_run=dry_run)
