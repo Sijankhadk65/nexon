@@ -56,11 +56,13 @@ def set_velocity(vel):
     return CURRENT_VEL
 
 
-# Velocity mode: "physical" (linear moves travel at PHYSICAL_VEL mm/s — the default)
-# or "percentage" (speed is 0-100% of max). Every LINEAR move reads VEL_MODE and
-# applies the matching MoveL parameters (see _movel_speed_kwargs). Joint moves (MoveJ)
-# are angular, so mm/s has no meaning there — they always use the percentage speed
-# regardless of mode.
+# OPERATION speed mode: "physical" (working strokes travel at PHYSICAL_VEL mm/s — the
+# default) or "percentage" (0-100% of max via CURRENT_VEL). This is the "doing work" speed
+# and is applied ONLY to the working strokes — the seam traverse, the red-line traverse, and
+# the descent onto a red dot (the moves that pass operation=True). EVERY OTHER move uses the
+# TRANSPORT_VEL transportation speed instead (see below), so a fast physical weld speed never
+# leaks into jogs / positioning. Joint moves (MoveJ) are angular, so mm/s has no meaning
+# there — they use a percentage regardless of mode.
 VEL_MODE = "physical"
 VEL_MODES = ("percentage", "physical")
 
@@ -100,13 +102,129 @@ def set_physical_velocity(vel_mm_s):
     return PHYSICAL_VEL
 
 
-def _movel_speed_kwargs():
-    """MoveL keyword args for the active velocity mode — checked on every linear move.
+# --------------------------------------------------------------------------- #
+# Transportation speed (positioning / jog moves)
+# --------------------------------------------------------------------------- #
+# The OPERATION speed above is the "doing work" speed and is applied ONLY to the working
+# strokes (seam traverse, red-line traverse, red-dot descent). EVERY OTHER linear move —
+# jogs (move_to / move_relative / move_direction) and the hover / approach / descend /
+# retract positioning legs — uses this TRANSPORTATION speed instead: ALWAYS a percentage of
+# max, low by default, so repositioning never inherits a fast physical weld speed. Joint
+# moves (home / joints) use it too.
+TRANSPORT_VEL = 10.0   # percentage of max for positioning / jog moves
 
-    "physical" -> vel/acc pinned to 100 (full scale, required on this firmware or the
-    move errors 183) with the real speed in ovl (mm/s) and acceleration in oacc (mm/s^2);
-    "percentage" -> vel=CURRENT_VEL (0-100).
+
+def set_transport_velocity(vel):
+    """Set the TRANSPORTATION speed (percentage of max) for jog / positioning moves.
+
+    Clamps to [VEL_MIN, VEL_MAX] and returns the stored value. This is separate from the
+    operation speed (set_velocity / set_physical_velocity), which only drives the working
+    strokes; transportation is always a percentage.
     """
+    global TRANSPORT_VEL
+    TRANSPORT_VEL = float(max(VEL_MIN, min(VEL_MAX, vel)))
+    log.info("robot: transport velocity set to %.1f%%", TRANSPORT_VEL)
+    return TRANSPORT_VEL
+
+
+# --------------------------------------------------------------------------- #
+# Weave / oscillation (welding weave overlaid on the traverse)
+# --------------------------------------------------------------------------- #
+# A weave overlays a side-to-side oscillation on the straight traverse MoveL:
+# WeaveSetPara -> WeaveStart -> traverse -> WeaveEnd, so the tool swings as it advances
+# along the seam (the motion a real weld weave makes). Ported from red_line_viewer's
+# weave_start/weave_end in the farino_app reference. The swing frequency is DERIVED so a
+# whole number of cycles fit the path at the physical travel speed — freq = count * speed
+# / path_len — so weave needs a KNOWN mm/s speed (VEL_MODE == "physical"); it is skipped in
+# percentage mode. Weave is MOTION ONLY: it fires no arc, exactly like the follow_* traces.
+WEAVE_ENABLED = False
+WEAVE_NUM = 0          # WeaveSetPara config slot on the controller
+WEAVE_TYPE = 0         # weaveType: 0=planar triangle, 4=planar sine, ... (see WeaveSetPara)
+WEAVE_RANGE = 4.0      # swing amplitude (total side-to-side width), mm
+# Weave spacing along the seam, set two mutually-exclusive ways (WEAVE_SPACING picks which):
+#   "cycles" -- WEAVE_COUNT full oscillations fitted over the WHOLE seam (count scales with
+#               seam length: freq = count * speed / path_len).
+#   "pitch"  -- WEAVE_PITCH mm advanced per oscillation, a fixed spacing INDEPENDENT of seam
+#               length (freq = speed / pitch); the usual weld spec (mm per weave).
+WEAVE_SPACING = "cycles"
+WEAVE_COUNT = 6.0      # oscillations over the whole seam, used when WEAVE_SPACING == "cycles"
+WEAVE_PITCH = 8.0      # mm advanced per oscillation, used when WEAVE_SPACING == "pitch"
+WEAVE_RANGE_MIN, WEAVE_RANGE_MAX = 0.1, 30.0
+WEAVE_COUNT_MIN, WEAVE_COUNT_MAX = 1.0, 200.0
+WEAVE_PITCH_MIN, WEAVE_PITCH_MAX = 0.5, 100.0
+
+# Human-friendly weave shape names -> Fairino weaveType codes (a useful subset of the
+# controller's patterns; see WeaveSetPara docs in the vendored SDK).
+WEAVE_PATTERNS = {
+    "triangle": 0,           # planar triangular (zig-zag)
+    "sine": 4,               # planar sine (smooth)
+    "vertical_triangle": 6,  # vertical triangular
+    "circle_cw": 2,          # clockwise circular
+    "circle_ccw": 3,         # counter-clockwise circular
+}
+
+
+def weave_settings():
+    """Current weave configuration as a plain dict.
+
+    Includes the active `spacing` mode plus BOTH the cycles and pitch_mm values (only the one
+    named by `spacing` drives the swing; the other is the last value you set for that mode).
+    """
+    name = next((k for k, v in WEAVE_PATTERNS.items() if v == WEAVE_TYPE), str(WEAVE_TYPE))
+    return {"enabled": WEAVE_ENABLED, "pattern": name, "weave_type": WEAVE_TYPE,
+            "amplitude_mm": WEAVE_RANGE, "spacing": WEAVE_SPACING,
+            "cycles": WEAVE_COUNT, "pitch_mm": WEAVE_PITCH}
+
+
+def configure_weave(enabled=None, pattern=None, amplitude_mm=None, cycles=None, pitch_mm=None):
+    """Enable/disable the weave and set its shape. Only the given fields change.
+
+    pattern is a name from WEAVE_PATTERNS ("triangle", "sine", ...); amplitude_mm/cycles/
+    pitch_mm are clamped to their safe ranges. `cycles` and `pitch_mm` are two mutually
+    exclusive ways to space the weave along the seam and setting one selects that spacing
+    mode (see WEAVE_SPACING): cycles = a fixed number of oscillations over the whole seam;
+    pitch_mm = a fixed mm advanced per oscillation, independent of seam length. If both are
+    passed, pitch_mm wins. Returns the resulting weave_settings(). Raises ValueError on an
+    unknown pattern name.
+    """
+    global WEAVE_ENABLED, WEAVE_TYPE, WEAVE_RANGE, WEAVE_COUNT, WEAVE_PITCH, WEAVE_SPACING
+    if enabled is not None:
+        WEAVE_ENABLED = bool(enabled)
+    if pattern is not None:
+        key = str(pattern).lower()
+        if key not in WEAVE_PATTERNS:
+            raise ValueError(f"pattern must be one of {sorted(WEAVE_PATTERNS)}, got {pattern!r}")
+        WEAVE_TYPE = WEAVE_PATTERNS[key]
+    if amplitude_mm is not None:
+        WEAVE_RANGE = float(max(WEAVE_RANGE_MIN, min(WEAVE_RANGE_MAX, amplitude_mm)))
+    # Spacing: cycles-over-seam vs fixed mm-pitch. Setting either selects its mode; pitch_mm
+    # takes precedence when both are given in one call.
+    if cycles is not None:
+        WEAVE_COUNT = float(max(WEAVE_COUNT_MIN, min(WEAVE_COUNT_MAX, cycles)))
+        WEAVE_SPACING = "cycles"
+    if pitch_mm is not None:
+        WEAVE_PITCH = float(max(WEAVE_PITCH_MIN, min(WEAVE_PITCH_MAX, pitch_mm)))
+        WEAVE_SPACING = "pitch"
+    spacing = (f"pitch={WEAVE_PITCH:.1f}mm/cycle" if WEAVE_SPACING == "pitch"
+               else f"cycles={WEAVE_COUNT:.0f}")
+    log.info("robot: weave %s | type=%d amplitude=%.1fmm %s",
+             "ON" if WEAVE_ENABLED else "OFF", WEAVE_TYPE, WEAVE_RANGE, spacing)
+    return weave_settings()
+
+
+def _movel_speed_kwargs(operation=False):
+    """MoveL keyword args for a linear move — TRANSPORTATION speed unless operation=True.
+
+    operation=False (default): the TRANSPORTATION speed — always percentage, vel=TRANSPORT_VEL
+    (0-100). Used for jogs and the hover / descend / retract positioning legs.
+
+    operation=True: the OPERATION speed in the active mode, used only for working strokes
+    (seam/line traverse, red-dot descent). "physical" -> vel/acc pinned to 100 (full scale,
+    required on this firmware or the move errors 183) with the real speed in ovl (mm/s) and
+    acceleration in oacc (mm/s^2); "percentage" -> vel=CURRENT_VEL (0-100).
+    """
+    if not operation:
+        return {"vel": TRANSPORT_VEL}
     if VEL_MODE == "physical":
         return {"vel": 100.0, "acc": 100.0, "ovl": PHYSICAL_VEL,
                 "oacc": PHYSICAL_ACC, "velAccParamMode": 1}
@@ -238,13 +356,15 @@ def solve_torch_down_rpy(robot, x, y, z, ref_joints, min_down=0.7):
 # --------------------------------------------------------------------------- #
 # Motion primitives
 # --------------------------------------------------------------------------- #
-def linear_move(robot, tool, user, x, y, z, rx=None, ry=None, rz=None, dry_run=False):
+def linear_move(robot, tool, user, x, y, z, rx=None, ry=None, rz=None, dry_run=False,
+                operation=False):
     """Straight-line MoveL to (x, y, z) in the base frame, with flexible orientation.
 
     Pass rx/ry/rz (degrees) to reorient the tool to that RPY along the line; omit
-    them to hold the current orientation. Speed is taken from the active velocity mode
-    (percentage of max, or physical mm/s — see _movel_speed_kwargs). dry_run IK-checks
-    the target and returns 0 without moving. Returns the SDK error code (0 = success).
+    them to hold the current orientation. Speed comes from _movel_speed_kwargs: the
+    TRANSPORTATION speed by default (positioning/jogs), or the OPERATION speed when
+    operation=True (working strokes only — seam/line traverse, red-dot descent). dry_run
+    IK-checks the target and returns 0 without moving. Returns the SDK error code (0 = success).
     """
     start_pose = robot.GetActualTCPPose()[1]  # [x, y, z, rx, ry, rz]
 
@@ -266,9 +386,10 @@ def linear_move(robot, tool, user, x, y, z, rx=None, ry=None, rz=None, dry_run=F
     if blocked:
         log.info("robot: axis lock active %s — those axes held fixed", blocked)
 
-    speed = _movel_speed_kwargs()
-    log.info("robot: MoveL target %s | %s=%s (dry_run=%s)",
-             [round(v, 1) for v in target], VEL_MODE, speed, dry_run)
+    speed = _movel_speed_kwargs(operation)
+    log.info("robot: MoveL target %s | %s speed=%s (dry_run=%s)",
+             [round(v, 1) for v in target],
+             ("operation/" + VEL_MODE) if operation else "transport", speed, dry_run)
 
     if dry_run:
         ref = robot.GetActualJointPosDegree()[1]
@@ -391,6 +512,62 @@ def move_base_direction(robot, tool, user, direction, distance, dry_run=False):
     return linear_move(robot, tool, user,
                        start[0] + dx, start[1] + dy, start[2] + dz,
                        dry_run=dry_run)
+
+
+def weave_plan(path_len_mm, speed_mms):
+    """Resolve the active spacing to concrete numbers for a given seam length + speed.
+
+    Pure computation (no robot). Returns a dict {freq_hz, cycles, pitch_mm} where — whichever
+    spacing mode is set — the OTHER quantity is derived from the seam length, so the automatic
+    value is visible before/without moving:
+      * "pitch"  -- pitch is fixed; cycles = path_len / pitch; freq = speed / pitch.
+      * "cycles" -- cycles is fixed; pitch = path_len / cycles; freq = cycles * speed / len.
+    Returns None if the seam length or speed is non-positive (no derivable swing).
+    """
+    if path_len_mm < 1e-3 or not speed_mms or speed_mms <= 0:
+        return None
+    if WEAVE_SPACING == "pitch":
+        pitch = WEAVE_PITCH
+        cycles = path_len_mm / pitch
+        freq = speed_mms / pitch
+    else:
+        cycles = WEAVE_COUNT
+        pitch = path_len_mm / cycles
+        freq = cycles * speed_mms / path_len_mm
+    return {"freq_hz": freq, "cycles": cycles, "pitch_mm": pitch}
+
+
+def weave_start(robot, path_len_mm, speed_mms):
+    """Configure + begin the weave oscillation for the upcoming traverse. Returns True if oscillating.
+
+    Derives the swing frequency from the active spacing mode (see weave_plan), then
+    WeaveSetPara + WeaveStart. Requires a physical travel speed (mm/s) and a non-zero path —
+    returns False (no oscillation) otherwise. Once started, the oscillation rides every
+    subsequent MoveL until weave_end. Mirrors red_line_viewer.weave_start in the farino_app
+    reference.
+    """
+    plan = weave_plan(path_len_mm, speed_mms)
+    if plan is None:
+        log.warning("robot: weave skipped — needs a physical mm/s speed and a non-zero path")
+        return False
+    rc = robot.WeaveSetPara(WEAVE_NUM, WEAVE_TYPE, plan["freq_hz"], 0, WEAVE_RANGE,
+                            0, 0, 0, 0, 0, 0, 0)
+    log.info("robot: WeaveSetPara(num=%d type=%d freq=%.3fHz range=%.1fmm) -> %s "
+             "(%s: %.1f cycles @ %.2f mm/cycle over %.0f mm at %.0f mm/s)",
+             WEAVE_NUM, WEAVE_TYPE, plan["freq_hz"], WEAVE_RANGE, rc, WEAVE_SPACING,
+             plan["cycles"], plan["pitch_mm"], path_len_mm, speed_mms)
+    if rc != 0:
+        return False
+    rc = robot.WeaveStart(WEAVE_NUM)
+    log.info("robot: WeaveStart(%d) -> %s", WEAVE_NUM, rc)
+    return rc == 0
+
+
+def weave_end(robot):
+    """End the weave oscillation. Safe to call even if it never started. Returns the SDK code."""
+    rc = robot.WeaveEnd(WEAVE_NUM)
+    log.info("robot: WeaveEnd(%d) -> %s", WEAVE_NUM, rc)
+    return rc
 
 
 # --------------------------------------------------------------------------- #

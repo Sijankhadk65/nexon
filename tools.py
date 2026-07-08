@@ -9,13 +9,20 @@ Two families:
     `robot_move_direction`, `robot_move_joints`): drives the Fairino arm via robot.py.
     Each opens a fresh connection, runs one move, and closes it — safe to repeat.
   - speed (`get_velocity_mode`, `set_robot_velocity`, `set_velocity_mode`,
-    `set_physical_velocity`): a single shared velocity in robot.py that every move reads,
-    so speed changes persist. Speed is interpreted either as a physical mm/s (the default
-    mode) or as a percentage of max, depending on the velocity mode; each linear move
-    checks the mode and applies the matching parameters.
+    `set_physical_velocity`, `set_transport_velocity`): TWO shared speeds in robot.py, both
+    persistent. The OPERATION speed (percentage or physical mm/s per the operation mode)
+    drives ONLY the working strokes — the seam traverse, the red-line traverse, and the
+    red-dot descent. The TRANSPORTATION speed (always a percentage, default 10%) drives every
+    other move — jogs, joint moves, and the hover/descend/retract positioning legs — so a
+    fast weld speed never leaks into repositioning.
   - axis locks (`set_axis_movement`): per-axis X/Y/Z enable flags in robot.py. Each linear
     move checks them and holds any locked axis fixed, so motion can be restricted to
     chosen axes.
+  - weave (`set_weave`, `get_weave_settings`): a welding weave (side-to-side oscillation)
+    overlaid on the follow_seam / follow_red_line traverse — WeaveSetPara -> WeaveStart ->
+    traverse -> WeaveEnd in robot.py. Config (on/off, pattern, amplitude, and spacing as
+    either a fixed mm pitch or a cycle count over the seam) persists; the swing rides the
+    physical mm/s speed (needs the physical velocity mode). Motion only.
   - eye-to-hand (`move_to_detection`): detect an object, map its pixel+depth to a base-frame
     XYZ via the calibrated camera->base extrinsic (robot.pixel_to_base / cam_to_base), and
     hover the tool over it. Needs T_base_cam.npy from calibrate_extrinsic.py.
@@ -28,11 +35,15 @@ Two families:
     centerline into ordered waypoints, and traces the CURVE (hover -> descend -> traverse each
     waypoint -> retract). detect_red_lines lists every line; follow_red_line traces them all
     along a greedy nearest route. Use for drawn red line(s) / red tape, straight or curved.
-  - seam (`set_seam_aoi`, `detect_seam`, `follow_seam`): set the scan region (AOI) in pixels,
-    then geometrically detect a bare-metal seam (the joint
+  - seam (`set_seam_aoi`, `detect_seam`, `follow_seam`, `follow_saved_seam`): set the scan
+    region (AOI) in pixels, then geometrically detect a bare-metal seam (the joint
     between two parts) in the DEPTH map within a configured AOI (seam.py), map both endpoints
-    to the base frame, and trace it (hover -> descend -> traverse -> retract). follow_seam is
-    MOTION ONLY — it never fires an arc/weld output; it's a safe dry run of the path.
+    to the base frame, and trace it (approach a LEAD-IN point just before the seam start ->
+    move to P1 -> traverse to P2 -> retract), held a fixed standoff ABOVE the seam. follow_seam
+    is MOTION ONLY — it never fires an arc/weld output; it's a safe dry run of the path.
+    follow_saved_seam traces a seam previously captured with 'w' in `uv run python seam.py`
+    (seam.json) instead of detecting live — a repeatable pass, valid while the camera hasn't
+    moved.
 
 Every move accepts dry_run=True to plan + IK-check the target WITHOUT moving the arm;
 prefer it first when a target might be out of reach. Call `shutdown()` on exit to
@@ -46,6 +57,11 @@ from langchain_core.tools import tool
 
 import robot
 import seam
+
+# Seam trace defaults, shared by detect_seam (preview) and follow_seam / follow_saved_seam so
+# the previewed lead-in / standoff match what the trace actually does.
+SEAM_STANDOFF_MM = 10.0   # height held ABOVE the detected seam surface for the whole trace
+SEAM_LEAD_IN_MM = 5.0     # -Y base-frame offset of the lead-in point before the seam start
 import vision
 
 
@@ -100,9 +116,10 @@ def get_robot_pose() -> str:
         "joints": [round(v, 2) for v in joints],
         "tool": tool,
         "user": user,
-        "velocity_mode": robot.VEL_MODE,
-        "velocity": robot.PHYSICAL_VEL if robot.VEL_MODE == "physical" else robot.CURRENT_VEL,
-        "velocity_unit": "mm/s" if robot.VEL_MODE == "physical" else "%",
+        "operation_velocity_mode": robot.VEL_MODE,
+        "operation_velocity": robot.PHYSICAL_VEL if robot.VEL_MODE == "physical" else robot.CURRENT_VEL,
+        "operation_velocity_unit": "mm/s" if robot.VEL_MODE == "physical" else "%",
+        "transport_velocity_pct": robot.TRANSPORT_VEL,
         "locked_axes": robot.locked_axes(),
     })
 
@@ -112,8 +129,8 @@ def robot_go_home(dry_run: bool = False) -> str:
     """Move the arm to its safe home configuration via MoveJ (joint-space, no IK needed).
 
     Use this to park the arm or recover to a known-good pose. Home joints are
-    [-90, -120, 85, -85, -90, 0] degrees. Runs at the current velocity (set with
-    set_robot_velocity).
+    [-90, -120, 85, -85, -90, 0] degrees. Runs at the TRANSPORTATION speed (set with
+    set_transport_velocity) — homing is positioning, not a working stroke.
 
     Args:
         dry_run: If true, report the planned move without moving the arm.
@@ -123,7 +140,7 @@ def robot_go_home(dry_run: bool = False) -> str:
         if dry_run:
             rob.CloseRPC()
             return json.dumps({"dry_run": True, "home_joints": robot.START_JOINTS})
-        ret = rob.MoveJ(robot.START_JOINTS, tool, user, vel=robot.CURRENT_VEL)
+        ret = rob.MoveJ(robot.START_JOINTS, tool, user, vel=robot.TRANSPORT_VEL)
         final = rob.GetActualTCPPose()[1]
         rob.CloseRPC()
     except Exception as exc:  # noqa: BLE001
@@ -148,7 +165,8 @@ def robot_move_to(
     Coordinates are in the active work frame. By default the current tool orientation is
     KEPT and the move is a pure straight-line translation (least erratic); if that target
     is unreachable that way, the tool is reoriented about a single base axis (roll, then
-    pitch, then yaw, smallest change first) to reach it. Runs at the current velocity.
+    pitch, then yaw, smallest change first) to reach it. Runs at the TRANSPORTATION speed
+    (a jog, set with set_transport_velocity — NOT the operation/weld speed).
     When a target might be out of reach, call once with dry_run=True first — it IK-checks
     the target (and the reorientation fallback) and reports reachability without moving.
 
@@ -196,8 +214,8 @@ def robot_move_relative(
     """Move the arm in a straight line (MoveL) relative to where it is now, by dx/dy/dz (mm).
 
     Use this for "move up 20 mm" or an explicit axis offset. Orientation is preserved, and
-    the move runs at the current velocity (set with set_robot_velocity). For "move
-    left/right/forward/back" prefer robot_move_direction, which maps those words to the
+    the move runs at the TRANSPORTATION speed (a jog, set with set_transport_velocity). For
+    "move left/right/forward/back" prefer robot_move_direction, which maps those words to the
     fixed base axes (right=+X, forward=+Y).
 
     Args:
@@ -234,8 +252,8 @@ def robot_move_direction(
     mapping is fixed in the robot base frame, matching the operator's convention:
       right = +X, left = -X, forward/front = +Y, back/backward = -Y.
     Left/right move along base X, front/back along base Y; height (Z) is never changed. The
-    move is a straight base-frame line with orientation preserved, at the current velocity
-    (set with set_robot_velocity). For up/down or an explicit axis offset use
+    move is a straight base-frame line with orientation preserved, at the TRANSPORTATION
+    speed (a jog, set with set_transport_velocity). For up/down or an explicit axis offset use
     robot_move_relative.
 
     Args:
@@ -271,7 +289,7 @@ def robot_move_joints(
     """Move the arm to six absolute joint angles (deg) via MoveJ (joint-space, no IK needed).
 
     Use this when the user specifies joint angles directly, or to reach a known joint
-    configuration. Runs at the current velocity (set with set_robot_velocity). For
+    configuration. Runs at the TRANSPORTATION speed (set with set_transport_velocity). For
     Cartesian targets use robot_move_to instead.
 
     Args:
@@ -289,7 +307,7 @@ def robot_move_joints(
         if dry_run:
             rob.CloseRPC()
             return json.dumps({"dry_run": True, "target_joints": target})
-        ret = rob.MoveJ(target, tool, user, vel=robot.CURRENT_VEL)
+        ret = rob.MoveJ(target, tool, user, vel=robot.TRANSPORT_VEL)
         final = rob.GetActualTCPPose()[1]
         rob.CloseRPC()
     except Exception as exc:  # noqa: BLE001
@@ -300,50 +318,55 @@ def robot_move_joints(
 
 @tool(parse_docstring=True)
 def set_robot_velocity(velocity: float) -> str:
-    """Set the arm's PERCENTAGE movement speed for all subsequent moves.
+    """Set the OPERATION speed as a PERCENTAGE (the working-stroke speed).
 
-    Use this whenever the user asks to change speed as a percentage ("go faster", "slow
-    down", "move at 50%"). The value persists — every later move runs at this speed
-    while the velocity mode is "percentage". It does not move the arm by itself. To
-    command a speed in mm/s instead, use set_velocity_mode("physical") +
+    Sets the operation speed used only for the working strokes — the seam traverse, the
+    red-line traverse, and the descent onto a red dot — while the operation mode is
+    "percentage". Use this when the user asks to change the WORK/weld speed as a percentage
+    ("weld at 40%"). It does NOT affect jogs or positioning moves — those use the separate
+    transportation speed (set_transport_velocity). The value persists; it does not move the
+    arm. To set the operation speed in mm/s instead, use set_velocity_mode("physical") +
     set_physical_velocity.
 
     Args:
-        velocity: Speed as a percentage of max, clamped to 1–100. Lower is safer.
+        velocity: Operation speed as a percentage of max, clamped to 1–100. Lower is safer.
     """
     try:
         stored = robot.set_velocity(velocity)
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid velocity: {exc}"})
-    return json.dumps({"success": True, "velocity": stored, "mode": robot.VEL_MODE})
+    return json.dumps({"success": True, "operation_velocity": stored, "mode": robot.VEL_MODE})
 
 
 @tool(parse_docstring=True)
 def get_velocity_mode() -> str:
-    """Read the arm's current velocity mode and speed settings. Read-only — never moves.
+    """Read the arm's OPERATION mode/speed and the TRANSPORTATION speed. Read-only — never moves.
 
-    Use this whenever the user asks about the current speed or mode ("what mode are we
-    in", "what speed is it set to"). Returns the active mode ("percentage" or
-    "physical"), the speed that mode uses (with its unit), and both stored values.
+    Use this whenever the user asks about the current speed or mode ("what mode are we in",
+    "what speed is it set to"). Two speeds are reported: the OPERATION speed (mode + value,
+    used only for the seam/line traverse and red-dot descent) and the TRANSPORTATION speed
+    (a percentage, used for every jog / positioning move).
     """
     return json.dumps({
-        "mode": robot.VEL_MODE,
-        "active_velocity": robot.PHYSICAL_VEL if robot.VEL_MODE == "physical" else robot.CURRENT_VEL,
-        "unit": "mm/s" if robot.VEL_MODE == "physical" else "%",
-        "percentage_velocity": robot.CURRENT_VEL,
-        "physical_velocity_mm_s": robot.PHYSICAL_VEL,
+        "operation_mode": robot.VEL_MODE,
+        "operation_velocity": robot.PHYSICAL_VEL if robot.VEL_MODE == "physical" else robot.CURRENT_VEL,
+        "operation_unit": "mm/s" if robot.VEL_MODE == "physical" else "%",
+        "operation_percentage_velocity": robot.CURRENT_VEL,
+        "operation_physical_velocity_mm_s": robot.PHYSICAL_VEL,
+        "transport_velocity_pct": robot.TRANSPORT_VEL,
     })
 
 
 @tool(parse_docstring=True)
 def set_velocity_mode(mode: str) -> str:
-    """Switch how the arm's speed is interpreted: percentage of max, or physical mm/s.
+    """Switch how the OPERATION speed is interpreted: percentage of max, or physical mm/s.
 
-    Use "percentage" for a 0–100% speed (set with set_robot_velocity) or "physical" to
-    make linear moves travel at a real speed in mm/s (set with set_physical_velocity).
-    The mode persists and every later linear move checks it. NOTE: joint moves
-    (robot_move_joints, robot_go_home) are angular and always use the percentage speed
-    regardless of mode. Does not move the arm.
+    Use "percentage" for a 0–100% operation speed (set with set_robot_velocity) or "physical"
+    to make the working strokes travel at a real speed in mm/s (set with set_physical_velocity).
+    This affects ONLY the operation speed (the seam/line traverse and red-dot descent); jogs
+    and positioning always use the transportation speed (a percentage). The mode persists.
+    NOTE: joint moves (robot_move_joints, robot_go_home) are angular and always use the
+    transportation percentage. Does not move the arm.
 
     Args:
         mode: Either "percentage" or "physical".
@@ -354,27 +377,109 @@ def set_velocity_mode(mode: str) -> str:
         return json.dumps({"error": f"invalid mode: {exc}"})
     active = robot.PHYSICAL_VEL if stored == "physical" else robot.CURRENT_VEL
     unit = "mm/s" if stored == "physical" else "%"
-    return json.dumps({"success": True, "mode": stored, "active_velocity": active, "unit": unit})
+    return json.dumps({"success": True, "operation_mode": stored,
+                       "operation_velocity": active, "unit": unit})
 
 
 @tool(parse_docstring=True)
 def set_physical_velocity(velocity_mm_s: float) -> str:
-    """Set the arm's PHYSICAL linear speed in mm/s (used when the velocity mode is physical).
+    """Set the OPERATION speed in mm/s (used when the operation mode is physical).
 
-    Use this when the user asks for a real travel speed ("move at 30 mm/s"). The value
-    persists and applies to linear moves (robot_move_to, robot_move_relative,
-    robot_move_direction) while the velocity mode is "physical" — call
-    set_velocity_mode("physical") to actually use it. It does not move the arm by itself.
+    Use this when the user asks for a real WORK/weld travel speed ("weld at 30 mm/s"). The
+    value persists and applies only to the working strokes — the seam traverse, the red-line
+    traverse, and the red-dot descent — while the operation mode is "physical"; call
+    set_velocity_mode("physical") to actually use it. It does NOT affect jogs or positioning
+    (those use set_transport_velocity), and does not move the arm by itself.
 
     Args:
-        velocity_mm_s: Linear TCP speed in millimetres per second, clamped to 1–250.
+        velocity_mm_s: Operation TCP speed in millimetres per second, clamped to 1–250.
             Lower is safer.
     """
     try:
         stored = robot.set_physical_velocity(velocity_mm_s)
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid velocity: {exc}"})
-    return json.dumps({"success": True, "physical_velocity_mm_s": stored, "mode": robot.VEL_MODE})
+    return json.dumps({"success": True, "operation_physical_velocity_mm_s": stored,
+                       "mode": robot.VEL_MODE})
+
+
+@tool(parse_docstring=True)
+def set_transport_velocity(velocity: float) -> str:
+    """Set the TRANSPORTATION speed (percentage) for jog / positioning moves.
+
+    This is the speed for every NON-working move: jogs (robot_move_to, robot_move_relative,
+    robot_move_direction), joint moves (robot_go_home, robot_move_joints), and the hover /
+    approach / descend / retract positioning legs of the follow/visit tools. It is ALWAYS a
+    percentage of max and defaults low (10%) for safety, so repositioning never runs at the
+    operation (weld) speed. Separate from the operation speed (set_robot_velocity /
+    set_physical_velocity), which only drives the seam/line traverse and red-dot descent. The
+    value persists; it does not move the arm.
+
+    Args:
+        velocity: Transportation speed as a percentage of max, clamped to 1–100. Lower is safer.
+    """
+    try:
+        stored = robot.set_transport_velocity(velocity)
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": f"invalid velocity: {exc}"})
+    return json.dumps({"success": True, "transport_velocity_pct": stored})
+
+
+@tool(parse_docstring=True)
+def set_weave(enabled: bool, pattern: str = "", amplitude_mm: float = 0.0,
+              cycles: float = 0.0, pitch_mm: float = 0.0) -> str:
+    """Turn the welding WEAVE (side-to-side oscillation) on or off and set its shape.
+
+    When weave is ON, the traverse of follow_seam / follow_red_line is overlaid with a
+    Fairino weave oscillation, so the tool swings side to side as it advances along the seam —
+    the motion a real weld weave makes. The spacing of the swings is set two mutually
+    exclusive ways: `pitch_mm` (a fixed mm advanced per weave — constant regardless of seam
+    length, the usual weld spec) OR `cycles` (a fixed number of swings fitted over the whole
+    seam). Setting one selects that mode; if both are given, pitch_mm wins. The swing
+    frequency is derived from that at the current PHYSICAL travel speed, so weave needs the
+    velocity mode set to "physical" (mm/s) — it is skipped with a note in percentage mode.
+    Weave is MOTION ONLY: it still fires no arc. Settings persist for the session and do not
+    move the arm by themselves.
+
+    Args:
+        enabled: True to weave on the next traverse, False to go back to a straight traverse.
+        pattern: Weave shape — "triangle" (planar zig-zag, default) or "sine" (smooth); also
+            "vertical_triangle", "circle_cw", "circle_ccw". Blank keeps the current pattern.
+        amplitude_mm: Total side-to-side swing width in mm (e.g. 4), clamped to 0.1–30.
+            0 or blank keeps the current width.
+        cycles: Spacing as a fixed number of full left-right swings over the WHOLE seam
+            (e.g. 6), clamped to 1–200. Selects "cycles" spacing. 0 or blank leaves it unset.
+        pitch_mm: Spacing as a fixed distance advanced per swing, in mm (e.g. 8), clamped to
+            0.5–100 — constant regardless of seam length. Selects "pitch" spacing. 0 or blank
+            leaves it unset.
+    """
+    try:
+        settings = robot.configure_weave(
+            enabled=enabled,
+            pattern=pattern or None,
+            amplitude_mm=amplitude_mm or None,
+            cycles=cycles or None,
+            pitch_mm=pitch_mm or None,
+        )
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": f"invalid weave setting: {exc}"})
+    out = {"success": True, **settings}
+    if enabled and robot.VEL_MODE != "physical":
+        out["note"] = ("velocity mode is percentage — weave needs physical mm/s; call "
+                       "set_velocity_mode('physical') so the weave can run on the traverse")
+    return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def get_weave_settings() -> str:
+    """Report the current welding WEAVE configuration. Read-only, never moves the arm.
+
+    Returns whether weave is enabled, its pattern, side-to-side amplitude (mm) and the active
+    spacing: either a fixed pitch (mm per swing) or a fixed number of cycles over the seam
+    (the `spacing` field says which; both stored values are reported). When enabled and the
+    velocity mode is physical, weave overlays the follow_seam / follow_red_line traverse.
+    """
+    return json.dumps(robot.weave_settings())
 
 
 @tool(parse_docstring=True)
@@ -417,7 +522,7 @@ def move_to_detection(
     orientation (a straight translation, least erratic); only if the target is unreachable
     that way does it reorient about a single axis. This is the "go to where the camera
     sees it" action. Requires a saved extrinsic (run calibrate_extrinsic.py first).
-    Speed/mode and axis locks apply.
+    Runs at the TRANSPORTATION speed (positioning); axis locks apply.
 
     ALWAYS prefer dry_run=True first: it locates the object and IK-checks the hover
     target without moving. Then run with dry_run=False.
@@ -439,11 +544,13 @@ def move_to_detection(
     return _hover_over_cam_xyz(loc["cam_xyz_mm"], hover_mm, descend_mm, dry_run, meta)
 
 
-def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta):
+def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta, operation=False):
     """Map a camera-frame XYZ to the base frame and hover the tool over it, then descend.
 
     Shared by move_to_detection and move_to_red_marker. Uses the keep-current-orientation
-    strategy (least erratic) and returns a JSON string result (with `meta` merged in).
+    strategy (least erratic) and returns a JSON string result (with `meta` merged in). The
+    hover is always TRANSPORTATION speed; with operation=True the DESCENT onto the target
+    runs at the OPERATION speed (used for the red-dot placement).
     """
     try:
         base = robot.cam_to_base(cam_xyz)
@@ -464,7 +571,8 @@ def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta):
         result["hover_result"] = ret
         result["hover_success"] = ret == 0
         if not dry_run and ret == 0 and descend_mm > 0:
-            ret2 = robot.linear_move(rob, tool, user, bx, by, hover_z - descend_mm)
+            ret2 = robot.linear_move(rob, tool, user, bx, by, hover_z - descend_mm,
+                                     operation=operation)
             result["descend_result"] = ret2
             result["descend_success"] = ret2 == 0
         if not dry_run:
@@ -475,20 +583,35 @@ def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta):
     return json.dumps(result)
 
 
-def _trace_polyline_base(points, hover_mm, dry_run, meta):
+def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_in=None):
     """Trace an ordered polyline of base-frame points: hover->descend->traverse each->retract.
 
     Shared by follow_seam and follow_red_line. `points` is an ordered list of length-3
     base-frame XYZ (mm), head->tail (>=2; a straight line is just two). Approaches above the
-    first point, descends to it, does a straight MoveL to every subsequent point in turn
-    (following a curve as a chain of short segments), then retracts above the last. Keeps the
-    current tool orientation (reorienting one axis only on the approach if it's unreachable).
-    MOTION ONLY — never fires an arc/weld output. Returns a JSON string (with `meta` merged in).
+    entry, descends to it, does a straight MoveL to every subsequent point in turn (following a
+    curve as a chain of short segments), then retracts above the last. Keeps the current tool
+    orientation (reorienting one axis only on the approach if it's unreachable). MOTION ONLY —
+    never fires an arc/weld output. Returns a JSON string (with `meta` merged in).
+
+    standoff_mm raises the WHOLE trace this far above each point's detected Z, so the tool
+    follows the seam at a constant clearance instead of touching it. lead_in, if given, is a
+    base-frame XYZ reached FIRST (before the first seam point) at the same standoff height —
+    the pre-seam approach point (later the arc-set point). Its own standoff is added too, so
+    pass it at the seam Z. Only the seam legs (points[0]->points[-1]) are the operation stroke;
+    the lead-in->first-point move is positioning (transport speed).
     """
-    pts = [[float(p[0]), float(p[1]), float(p[2])] for p in points]
+    sz = float(standoff_mm)
+    pts = [[float(p[0]), float(p[1]), float(p[2]) + sz] for p in points]  # trace standoff above
     first, last = pts[0], pts[-1]
-    waypoints = [("hover_p1", first[0], first[1], first[2] + hover_mm),
-                 ("descend_p1", first[0], first[1], first[2])]
+    waypoints = []
+    if lead_in is not None:
+        li = [float(lead_in[0]), float(lead_in[1]), float(lead_in[2]) + sz]
+        waypoints.append(("hover_lead_in", li[0], li[1], li[2] + hover_mm))
+        waypoints.append(("descend_lead_in", li[0], li[1], li[2]))
+        waypoints.append(("move_to_p1", first[0], first[1], first[2]))
+    else:
+        waypoints.append(("hover_p1", first[0], first[1], first[2] + hover_mm))
+        waypoints.append(("descend_p1", first[0], first[1], first[2]))
     for i, p in enumerate(pts[1:], start=1):
         waypoints.append((f"traverse_{i}", p[0], p[1], p[2]))
     waypoints.append(("retract", last[0], last[1], last[2] + hover_mm))
@@ -500,22 +623,62 @@ def _trace_polyline_base(points, hover_mm, dry_run, meta):
         "p2_base_mm": [round(v, 1) for v in last],
         "num_waypoints": len(pts),
         "length_mm": round(length, 1),
-        "hover_mm": hover_mm, "dry_run": dry_run, "motion_only": True, "steps": [],
+        "hover_mm": hover_mm, "standoff_mm": round(sz, 1),
+        "dry_run": dry_run, "motion_only": True, "steps": [],
     })
+    if lead_in is not None:
+        result["lead_in_base_mm"] = [round(li[0], 1), round(li[1], 1), round(li[2], 1)]
+    # Weave: overlay a side-to-side oscillation on the TRAVERSE legs (not the hover/descend/
+    # retract). It rides a physical mm/s speed so the cycle count holds, so it only applies in
+    # physical velocity mode and never on a dry run (which just IK-checks the path). The weave
+    # is ALWAYS ended in the finally below, even if a leg errors, so it's never left running.
+    want_weave = robot.WEAVE_ENABLED and not dry_run
+    speed_mms = robot.PHYSICAL_VEL if robot.VEL_MODE == "physical" else None
+    if want_weave and speed_mms is None:
+        result["weave"] = {"applied": False,
+                           "note": "weave needs physical velocity mode (mm/s) — "
+                                   "call set_velocity_mode('physical')"}
+        want_weave = False
     try:
         rob, tool, user = robot.connect_and_enable()
         ok = True
-        for i, (label, x, y, z) in enumerate(waypoints):
-            if i == 0:  # first waypoint may reorient a single axis if unreachable
-                ret = robot.linear_move_keep_orientation(rob, tool, user, x, y, z, dry_run=dry_run)
-            else:       # rest are pure translations along the line, orientation held
-                ret = robot.linear_move(rob, tool, user, x, y, z, dry_run=dry_run)
-            result["steps"].append({"step": label,
-                                    "target_mm": [round(x, 1), round(y, 1), round(z, 1)],
-                                    "result": ret, "success": ret == 0})
-            if ret != 0:
-                ok = False
-                break
+        weaving = False
+        try:
+            for i, (label, x, y, z) in enumerate(waypoints):
+                # Begin the weave right before the first traverse leg (after descending to P1)
+                # so the oscillation rides the whole seam-following traverse; end it after the
+                # last traverse leg, before retracting straight up.
+                if want_weave and not weaving and label.startswith("traverse"):
+                    weaving = robot.weave_start(rob, length, speed_mms)
+                    result["weave"] = {"applied": weaving, "path_len_mm": round(length, 1),
+                                       "speed_mm_s": speed_mms, **robot.weave_settings()}
+                    # Surface the derived spacing for THIS seam: in cycles mode the pitch is
+                    # automatic (pitch = length / cycles), in pitch mode the cycle count is.
+                    plan = robot.weave_plan(length, speed_mms)
+                    if plan is not None:
+                        result["weave"].update({
+                            "effective_cycles": round(plan["cycles"], 1),
+                            "effective_pitch_mm": round(plan["pitch_mm"], 2),
+                            "weave_freq_hz": round(plan["freq_hz"], 3)})
+                if weaving and label == "retract":
+                    robot.weave_end(rob)
+                    weaving = False
+                if i == 0:  # first waypoint (hover) may reorient a single axis if unreachable
+                    ret = robot.linear_move_keep_orientation(rob, tool, user, x, y, z, dry_run=dry_run)
+                else:       # rest are pure translations along the line, orientation held
+                    # Only the traverse legs are the working stroke (seam/line) -> OPERATION
+                    # speed; descend-to-P1 and retract are positioning -> transportation.
+                    ret = robot.linear_move(rob, tool, user, x, y, z, dry_run=dry_run,
+                                            operation=label.startswith("traverse"))
+                result["steps"].append({"step": label,
+                                        "target_mm": [round(x, 1), round(y, 1), round(z, 1)],
+                                        "result": ret, "success": ret == 0})
+                if ret != 0:
+                    ok = False
+                    break
+        finally:
+            if weaving:
+                robot.weave_end(rob)
         result["success"] = ok
         if not dry_run:
             result["final_pose"] = [round(v, 1) for v in rob.GetActualTCPPose()[1]]
@@ -683,8 +846,9 @@ def move_to_red_marker(
     closest not-yet-visited marker next): hovers `hover_mm` above each and optionally
     descends `descend_mm`. Motion keeps the current tool
     orientation (least erratic), reorienting one axis only if unreachable. Requires a saved
-    extrinsic (calibrate_extrinsic.py). Speed/mode and axis locks apply. If only one marker
-    is in view this simply visits it.
+    extrinsic (calibrate_extrinsic.py). The hover between markers runs at the TRANSPORTATION
+    speed; the descent onto each dot runs at the OPERATION speed. Axis locks apply. If only
+    one marker is in view this simply visits it.
 
     ALWAYS prefer dry_run=True first: it locates every marker and IK-checks each hover without
     moving (all markers are checked so you see which are reachable). Then run with
@@ -711,8 +875,10 @@ def move_to_red_marker(
         if m.get("cam_xyz_mm") is None:
             visits.append({**meta, "skipped": m.get("note", "no depth there — reposition")})
             continue
+        # The descent onto the dot is the red-dot working stroke -> OPERATION speed; the
+        # hover between markers stays transportation.
         visit = json.loads(_hover_over_cam_xyz(
-            m["cam_xyz_mm"], hover_mm, descend_mm, dry_run, meta))
+            m["cam_xyz_mm"], hover_mm, descend_mm, dry_run, meta, operation=True))
         visits.append(visit)
         # On a real run, halt the sequence if a hover errors or IK-fails — don't keep
         # commanding motions after a failure. In dry_run, check every marker regardless.
@@ -815,10 +981,13 @@ def follow_red_line(hover_mm: float = 60.0, num_samples: int = 12, dry_run: bool
     them to the base frame, then traces the lines along a greedy nearest-neighbour route —
     entering each line at whichever endpoint is closer. Per line it runs: hover above the entry
     point -> descend -> straight MoveL through every waypoint (tracing the curve) -> retract
-    above the exit. Traverse speed follows the current velocity/mode (use physical mm/s for a
-    real travel speed). Keeps the current tool orientation (reorienting one axis only if an
-    approach is unreachable); axis locks apply. Does NOT weld. Requires a saved extrinsic. If
-    only one line is in view this simply traces it.
+    above the exit. The traverse runs at the OPERATION speed/mode (use physical mm/s for a
+    real travel speed); hover/descend/retract use the transportation speed. If the weave is
+    enabled (set_weave) and the operation mode is physical, each traverse is overlaid with a
+    side-to-side weave oscillation. Keeps the current tool orientation (reorienting one axis
+    only if an approach is unreachable); axis locks apply.
+    Does NOT weld (the weave is motion only). Requires a saved extrinsic. If only one line is
+    in view this simply traces it.
 
     ALWAYS prefer dry_run=True first: it IK-checks every waypoint of every line without moving.
     On a real run the sequence stops at the first line whose trace fails.
@@ -912,8 +1081,11 @@ def detect_seam() -> str:
     Detects the bare-metal seam geometrically in the DEPTH map within the configured area
     of interest (AOI) — the joint shows as a gap/step/crease in the surface. Returns both
     endpoints as pixels and — if the camera is calibrated (T_base_cam.npy) — as base-frame
-    XYZ with the seam's 3D length. Needs an AOI set via `uv run python seam.py`. Use this to
-    see where the weld seam is before tracing it with follow_seam.
+    XYZ with the seam's 3D length. Also previews how follow_seam would trace it: the LEAD-IN
+    point (P1 offset -5 mm in base Y, the pre-seam / future arc-set point) and the standoff
+    height (10 mm) the trace is held above the surface. p1/p2 base XYZ are the raw on-surface
+    readings; the trace runs standoff above them. Needs an AOI set via `uv run python seam.py`.
+    Use this to see where the seam is (and where the lead-in lands) before tracing it.
     """
     try:
         loc = vision.get_hub().locate_seam()
@@ -929,26 +1101,45 @@ def detect_seam() -> str:
         out["p1_base_mm"] = [round(float(v), 1) for v in b1]
         out["p2_base_mm"] = [round(float(v), 1) for v in b2]
         out["length_mm"] = round(float(np.linalg.norm(b2 - b1)), 1)
+        # Preview the follow_seam trace geometry: lead-in point + standoff height. The trace
+        # holds SEAM_STANDOFF_MM above the surface, and starts SEAM_LEAD_IN_MM behind P1 in Y.
+        out["standoff_mm"] = SEAM_STANDOFF_MM
+        out["lead_in_base_mm"] = [round(float(b1[0]), 1),
+                                  round(float(b1[1]) - SEAM_LEAD_IN_MM, 1),
+                                  round(float(b1[2]) + SEAM_STANDOFF_MM, 1)]
+        out["trace_p1_base_mm"] = [round(float(b1[0]), 1), round(float(b1[1]), 1),
+                                   round(float(b1[2]) + SEAM_STANDOFF_MM, 1)]
+        out["trace_p2_base_mm"] = [round(float(b2[0]), 1), round(float(b2[1]), 1),
+                                   round(float(b2[2]) + SEAM_STANDOFF_MM, 1)]
     except FileNotFoundError:
         out["note"] = "camera not calibrated (no T_base_cam.npy) — pixels only"
     return json.dumps(out)
 
 
 @tool(parse_docstring=True)
-def follow_seam(hover_mm: float = 60.0, dry_run: bool = False) -> str:
+def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
+                lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
     """Trace the seam (joint between two parts) — MOTION ONLY, never fires an arc or weld output.
 
-    Locates the seam (geometrically, in depth within the AOI), maps both endpoints to the base frame via the calibrated
-    camera->base transform, then runs: hover above P1 -> descend to P1 -> straight traverse
-    to P2 -> retract above P2. The traverse is a straight MoveL at the current velocity/mode
-    (use physical mm/s for a real weld-travel speed). Keeps the current tool orientation
-    (reorienting one axis only if a waypoint is unreachable); axis locks apply. This is a
-    safe dry run of the weld path — it does NOT weld. Requires a saved extrinsic.
+    Locates the seam (geometrically, in depth within the AOI), maps both endpoints to the base
+    frame via the calibrated camera->base transform, then runs: hover above the lead-in ->
+    descend to the LEAD-IN point (P1 offset -lead_in_mm in base Y, the pre-seam / future
+    arc-set point) -> move to P1 -> straight traverse to P2 -> retract. The WHOLE trace is held
+    `standoff_mm` above the seam's detected surface (so the tool follows the seam at a constant
+    clearance, never touching it). The P1->P2 traverse runs at the OPERATION speed/mode (use
+    physical mm/s for a real travel speed); the lead-in approach and positioning use the
+    transportation speed. If the weave is enabled (set_weave) and the operation mode is
+    physical, the P1->P2 traverse is overlaid with a side-to-side weave oscillation. Keeps the
+    current tool orientation (reorienting one axis only if a waypoint is unreachable); axis
+    locks apply. Requires a saved extrinsic.
 
     ALWAYS prefer dry_run=True first: it IK-checks every waypoint without moving.
 
     Args:
-        hover_mm: Approach/retract height above the seam endpoints, in mm (default 60).
+        hover_mm: Approach/retract height above the lead-in / seam, in mm (default 60).
+        standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
+        lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
+            offset from P1, in mm (default 5). 0 disables the lead-in.
         dry_run: If true, IK-check all waypoints without moving the arm.
     """
     try:
@@ -962,7 +1153,52 @@ def follow_seam(hover_mm: float = 60.0, dry_run: bool = False) -> str:
         b2 = robot.cam_to_base(loc["p2_cam_xyz_mm"])
     except FileNotFoundError as exc:
         return json.dumps({"error": str(exc)})
-    return _trace_polyline_base([b1, b2], hover_mm, dry_run, {})
+    # Lead-in: a point before the seam start, offset -lead_in_mm in base Y (later the arc-set
+    # point). Same Z as P1; the standoff is added inside _trace_polyline_base.
+    lead_in = None if lead_in_mm <= 0 else [b1[0], b1[1] - float(lead_in_mm), b1[2]]
+    return _trace_polyline_base([b1, b2], hover_mm, dry_run, {},
+                                standoff_mm=standoff_mm, lead_in=lead_in)
+
+
+@tool(parse_docstring=True)
+def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
+                      lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
+    """Trace the SAVED seam captured in the seam.py preview — MOTION ONLY, never fires an arc.
+
+    Loads the seam saved with 'w' in `uv run python seam.py` (seam.json) instead of detecting
+    live, maps its endpoints to the base frame via the calibrated camera->base transform, then
+    runs the same lead-in -> move to P1 -> traverse to P2 -> retract path as follow_seam, held
+    `standoff_mm` above the seam (a weave overlays the P1->P2 traverse if enabled via set_weave).
+    Use this to re-run a seam you captured earlier without re-detecting — the camera must NOT
+    have moved since it was saved, as the endpoints are stored in the camera frame. Requires a
+    saved seam (seam.json) and a saved extrinsic (T_base_cam.npy).
+
+    ALWAYS prefer dry_run=True first: it IK-checks every waypoint without moving.
+
+    Args:
+        hover_mm: Approach/retract height above the lead-in / seam, in mm (default 60).
+        standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
+        lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
+            offset from P1, in mm (default 5). 0 disables the lead-in.
+        dry_run: If true, IK-check all waypoints without moving the arm.
+    """
+    rec = seam.load_seam()
+    if rec is None:
+        return json.dumps({"error": "no saved seam — capture one by pressing 'w' in "
+                                    "'uv run python seam.py'"})
+    try:
+        b1 = robot.cam_to_base(rec["p1_cam_xyz_mm"])
+        b2 = robot.cam_to_base(rec["p2_cam_xyz_mm"])
+    except FileNotFoundError as exc:
+        return json.dumps({"error": str(exc)})
+    except (KeyError, TypeError):
+        return json.dumps({"error": "saved seam is missing camera-frame endpoints — "
+                                    "re-save it with 'w' in seam.py"})
+    lead_in = None if lead_in_mm <= 0 else [b1[0], b1[1] - float(lead_in_mm), b1[2]]
+    return _trace_polyline_base([b1, b2], hover_mm, dry_run,
+                                {"source": "saved_seam", "saved_at": rec.get("saved_at"),
+                                 "length_mm": rec.get("length_mm")},
+                                standoff_mm=standoff_mm, lead_in=lead_in)
 
 
 # All tools exposed to the orchestrator. Add future robot tools here.
@@ -979,6 +1215,9 @@ ALL_TOOLS = [
     set_robot_velocity,
     set_velocity_mode,
     set_physical_velocity,
+    set_transport_velocity,
+    set_weave,
+    get_weave_settings,
     set_axis_movement,
     robot_go_home,
     robot_move_to,
@@ -989,6 +1228,7 @@ ALL_TOOLS = [
     move_to_red_marker,
     follow_red_line,
     follow_seam,
+    follow_saved_seam,
 ]
 
 
