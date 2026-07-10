@@ -18,12 +18,13 @@ import json
 import threading
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QMainWindow, QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
 from nexon.controller import get_controller
 from nexon.ui.authorizer import ArcAuthorizer
+from nexon.ui.settings_dialog import SettingsDialog
 from nexon.ui.video import VideoView
 
 ARC_ARMED_CSS = "background:#b00020; color:white; padding:8px; border-radius:4px;"
@@ -56,6 +57,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ layout
 
     def _build(self) -> None:
+        self._build_menu()
         self._video = VideoView(self._hub)
 
         self._arc = QLabel("WELDING OFF")
@@ -120,6 +122,26 @@ class MainWindow(QMainWindow):
         central.setLayout(root)
         self.setCentralWidget(central)
         self.statusBar().showMessage("ready")
+
+    def _build_menu(self) -> None:
+        settings_action = QAction("&Settings…", self)
+        settings_action.setShortcut(QKeySequence.Preferences)
+        settings_action.triggered.connect(self._on_settings)
+
+        quit_action = QAction("&Quit", self)
+        quit_action.setShortcut(QKeySequence.Quit)
+        quit_action.triggered.connect(self.close)
+
+        menu = self.menuBar().addMenu("&File")
+        menu.addAction(settings_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+
+    def _on_settings(self) -> None:
+        # Modal and on the GUI thread: the dialog touches no robot state, and its one
+        # blocking call (listing voices) runs on its own worker.
+        if SettingsDialog(self).exec():
+            self.statusBar().showMessage("settings saved — restart the chat app to apply")
 
     # ------------------------------------------------------------- threading
 

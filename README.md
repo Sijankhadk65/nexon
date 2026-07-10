@@ -101,7 +101,17 @@ uv run python scripts/view.py "metal tube" "flange"        # measure these, live
 uv run python scripts/view.py --no-measure "person" "cup"   # boxes only, faster
 ```
 
-## Configuration (environment variables)
+## Configuration
+
+API keys and the TTS voice can be set from the operator console — `uv run nexon-ui`, then
+**File → Settings**. Keys go to the system keyring (or, where no secret service is running,
+to `~/.config/nexon/secrets.ini` with mode `0600`); the voice id goes to
+`~/.config/nexon/settings.ini`. Nothing is written into the repo. The chat app picks these
+up at startup.
+
+Every one of them can still be set in the environment, and **the environment wins** — an
+exported variable overrides what the dialog saved, and the dialog marks that field read-only
+so you cannot save a value that would never be used.
 
 | Variable | Default | Purpose |
 |---|---|---|

@@ -31,7 +31,7 @@ from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-from nexon import logs
+from nexon import logs, settings
 from nexon.voice import fsm
 
 # tools/vision/stt are imported inside main() under logs.mute_stdout so their
@@ -441,11 +441,16 @@ class Speaker:
 
 
 def main():
+    # Fill in the keys saved from the UI's settings dialog. An explicit `export` still
+    # wins — this only fills gaps — and it must run before any SDK client is built, since
+    # langchain and elevenlabs read these straight out of the environment.
+    settings.apply_to_env()
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         # Printed before logging is set up, so it reaches the screen.
         print(
             "ANTHROPIC_API_KEY is not set.\n"
-            "Set it before starting the chat, e.g.:\n"
+            "Set it in the UI (`uv run nexon-ui` → Settings), or export it:\n"
             "  export ANTHROPIC_API_KEY=sk-ant-...\n",
             file=sys.stderr,
         )
