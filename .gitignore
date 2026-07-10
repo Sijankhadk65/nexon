@@ -1,0 +1,29 @@
+# Graphify
+/graphify-out/
+
+# Claude
+/.claude/
+
+# Python
+/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Exclude virtual environments
+/.venv/
+.env
+
+# Project files
+
+/docs/
+
+/fairino_sdk/
+
+# Camera capture snapshots
+/frame.jpg
+/detections.jpg
+/view.jpg
+/snapshot_*.jpg
+/Log/
