@@ -205,6 +205,16 @@ class VisionHub:
 
     # -- detection (called by the tool) -------------------------------------
 
+    def latest(self):
+        """The most recent CapturedFrame and the detections drawn on it, or (None, []).
+
+        Non-blocking, for a UI that paints on its own clock. The returned frame is whatever
+        the capture thread last published; callers that keep it beyond the next frame must
+        copy it, since the camera's BGR buffer can be recycled.
+        """
+        with self._lock:
+            return self._cap, list(self._dets)
+
     def _latest_capture(self, timeout: float = 2.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
