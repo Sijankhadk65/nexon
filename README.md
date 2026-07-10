@@ -10,7 +10,7 @@ it's working with. The design is deliberately modular so the same orchestrator c
 drive other robots and swap in different vision models.
 
 ```
- ┌─────────────────────────── nexon (main.py) ───────────────────────────┐
+ ┌─────────────────────────── nexon (app.py) ────────────────────────────┐
  │  you ──voice/text──▶  Claude (orchestrator)  ──speaks──▶ you           │
  │                            │  calls tools                              │
  │                            ▼                                           │
@@ -71,7 +71,7 @@ Key Python dependencies (installed automatically): `pyorbbecsdk2` (Orbbec SDK v2
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 export ELEVENLABS_API_KEY=...        # optional, for voice
-uv run python main.py
+uv run nexon
 ```
 
 Then just talk to it — e.g. *"What can you see?"*, *"Is there a metal tube in front of
@@ -97,8 +97,8 @@ replies out loud.
 Run detection/measurement without the chat (uses the camera exclusively):
 
 ```bash
-uv run python view.py "metal tube" "flange"        # measure these, live
-uv run python view.py --no-measure "person" "cup"   # boxes only, faster
+uv run python scripts/view.py "metal tube" "flange"        # measure these, live
+uv run python scripts/view.py --no-measure "person" "cup"   # boxes only, faster
 ```
 
 ## Configuration (environment variables)
@@ -113,23 +113,32 @@ uv run python view.py --no-measure "person" "cup"   # boxes only, faster
 | `NEXON_MIC` | auto (USB mic) | `arecord -D` capture device |
 | `NEXON_STT_MODEL` | `scribe_v1` | ElevenLabs STT model |
 | `NEXON_NO_WINDOW` | (unset) | Set to disable the live preview window |
+| `NEXON_DATA_DIR` | `data/` | Saved seam, seam AOI, camera→base extrinsic |
+| `NEXON_LOG_DIR` | `Log/` | Timestamped log files |
 
 ## Project layout
 
-| Module | Responsibility |
-|---|---|
-| `main.py` | Chat loop, agentic tool loop, TTS, voice input, language, logging setup |
-| `camera.py` | Gemini 336L capture: RGB, depth aligned to colour, camera intrinsics |
-| `detector.py` | Swappable `Detector` interface + Grounding DINO open-vocab backend |
-| `dimensioner.py` | Detection box + depth → real-world dimensions (deprojection + PCA) |
-| `vision.py` | `VisionHub`: shared camera/detector + live preview window |
-| `tools.py` | The `detect_objects` LangChain tool Claude calls |
-| `viz.py` | Shared drawing helpers (boxes, labels, dimensions, depth colormap) |
-| `view.py` | Standalone live detection/measurement viewer |
-| `stt.py` | Push-to-talk speech-to-text (ElevenLabs Scribe + `arecord`) |
-| `logs.py` | Splits output: conversation to screen, everything to a timestamped log |
+```
+src/nexon/
+├── app.py             Chat loop, agentic tool loop, TTS, language, startup
+├── paths.py           Where the data dir, log dir, and vendored SDK live
+├── robot.py           Fairino arm: motion, weave, arc welding, extrinsic
+├── logs.py            Conversation to screen, everything else to a log file
+├── agent/tools.py     The LangChain tools Claude calls
+├── voice/             fsm (turn-taking) · stt (push-to-talk) · barge (barge-in)
+├── perception/        camera · detector · dimensioner · marker · seam · vision · viz
+└── ui/                Desktop window (in progress)
 
-Logs are written to `Log/nexon_<timestamp>.txt`.
+scripts/               Standalone CLIs: view · depth_probe · calibrate_extrinsic · test_weave
+data/                  Saved seam, seam AOI, camera→base extrinsic
+```
+
+`perception/vision.py` holds the `VisionHub` that shares one camera and detector between
+the chat and the live preview window. `perception/seam.py` both detects seams and, run as
+`uv run python -m nexon.perception.seam`, opens the AOI-drawing preview.
+
+Logs are written to `Log/nexon_<timestamp>.txt`, next to the repo root regardless of where
+you launch from. Override with `NEXON_LOG_DIR` / `NEXON_DATA_DIR`.
 
 ## How measurement works
 

@@ -15,7 +15,7 @@ Red is matched by two complementary cues, OR-ed together:
 
 The mask is morphologically cleaned (OPEN clears specks, CLOSE fills the blob), then the
 largest region's centroid is returned. Run directly for a live mask+overlay preview to
-tune the thresholds:  uv run python marker.py
+tune the thresholds:  uv run python -m nexon.perception.marker
 """
 
 import sys
@@ -326,7 +326,7 @@ def find_red_lines(bgr, min_area=MIN_LINE_AREA, min_elongation=MIN_ELONGATION,
 
 def main():
     """Live preview: shows the frame with the detected marker + the red mask, to tune."""
-    from camera import OrbbecCamera
+    from nexon.perception.camera import OrbbecCamera
 
     try:
         cam = OrbbecCamera()

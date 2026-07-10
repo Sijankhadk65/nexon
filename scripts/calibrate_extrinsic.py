@@ -15,7 +15,7 @@ WORKFLOW (collect >= 6 points; spread them in X, Y AND HEIGHT):
      points!) and repeat.
   5. Press 'g' to solve + save. Points must NOT be coplanar, or the Z fit is unconstrained.
 
-Run:   uv run python calibrate_extrinsic.py
+Run:   uv run python scripts/calibrate_extrinsic.py
 Keys:  r=record pose   click=record cam XYZ   n/SPACE=bank   u=undo
        g=solve+gate+save   q/ESC=quit (auto-solves if >=3)
 
@@ -29,8 +29,8 @@ import sys
 import cv2 as cv
 import numpy as np
 
-import robot
-from camera import OrbbecCamera
+from nexon import robot
+from nexon.perception.camera import OrbbecCamera
 
 DEPTH_PATCH = 5          # NxN median depth patch around a click (robust to holes)
 MIN_POINTS = 6           # recommended; need >=3 non-coplanar to solve

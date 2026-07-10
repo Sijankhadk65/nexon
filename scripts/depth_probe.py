@@ -16,7 +16,7 @@ roughly what a seam-line fit over many pixels/frames gets you. Compare BOTH to 1
 Sample a flat matte patch (never an edge — edges give flying pixels), and let the
 sensor warm up a couple of minutes first (depth drifts until it's thermally stable).
 
-Run:   uv run python depth_probe.py
+Run:   uv run python scripts/depth_probe.py
 Keys:  click = set the probe pixel   SPACE / g = run a measurement burst
        + / - = grow / shrink the median patch   q / Esc = quit
 
@@ -30,7 +30,7 @@ import sys
 import cv2
 import numpy as np
 
-from camera import OrbbecCamera
+from nexon.perception.camera import OrbbecCamera
 
 WINDOW = "depth_probe"
 

@@ -24,9 +24,11 @@ from pathlib import Path
 
 import numpy as np
 
+from nexon import paths
+
 # Vendored Fairino SDK: fairino_sdk/linux/fairino/Robot.py. Add it to the path by
 # absolute location so imports work regardless of the process' working directory.
-_SDK_DIR = Path(__file__).resolve().parent / "fairino_sdk" / "linux" / "fairino"
+_SDK_DIR = paths.SDK_DIR
 if str(_SDK_DIR) not in sys.path:
     sys.path.insert(0, str(_SDK_DIR))
 import Robot  # noqa: E402 — must follow the sys.path insert above
@@ -673,7 +675,7 @@ def weave_end(robot):
 # calibrate_extrinsic.py (Umeyama fit of touched base points vs. depth-deprojected
 # camera points). Loaded lazily and cached so runtime tools can turn a detected
 # pixel + depth into a base-frame target.
-EXTRINSIC_FILE = Path(__file__).resolve().parent / "T_base_cam.npy"
+EXTRINSIC_FILE = paths.DATA_DIR / "T_base_cam.npy"
 _T_base_cam = None
 
 

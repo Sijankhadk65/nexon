@@ -9,9 +9,9 @@ Detection runs in a background thread, so the video stays smooth (~30 fps) even
 though the model takes ~1–2 s per pass on this CPU — boxes just refresh each time
 a pass finishes.
 
-    uv run python view.py "metal tube" "flange"          # measure these, live
-    uv run python view.py --no-measure "person" "cup"     # boxes only (faster)
-    uv run python view.py --min-confidence 0.5 "bottle"
+    uv run python scripts/view.py "metal tube" "flange"         # measure these, live
+    uv run python scripts/view.py --no-measure "person" "cup"   # boxes only (faster)
+    uv run python scripts/view.py --min-confidence 0.5 "bottle"
 
 Keys:  q / Esc quit    m toggle measurement    d toggle depth view    s snapshot
 
@@ -26,10 +26,10 @@ import time
 
 import cv2
 
-from camera import OrbbecCamera
-from detector import load_detector
-from dimensioner import measure_all
-from viz import colorize_depth, draw_detections
+from nexon.perception.camera import OrbbecCamera
+from nexon.perception.detector import load_detector
+from nexon.perception.dimensioner import measure_all
+from nexon.perception.viz import colorize_depth, draw_detections
 
 
 def _has_display() -> bool:

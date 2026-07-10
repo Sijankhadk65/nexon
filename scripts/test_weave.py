@@ -27,10 +27,10 @@ weaveType / pattern names (robot.WEAVE_PATTERNS):
 
 Run from the nexon dir:
 
-    uv run python test_weave.py                       # DRY RUN (prints the plan only)
-    uv run python test_weave.py --live                # swing the arm, no arc
-    uv run python test_weave.py --live --pattern sine --range 8 --cycles 12 --speed 15
-    uv run python test_weave.py --live --dist 150 --axis y
+    uv run python scripts/test_weave.py           # DRY RUN (prints the plan only)
+    uv run python scripts/test_weave.py --live    # swing the arm, no arc
+    uv run python scripts/test_weave.py --live --pattern sine --range 8 --cycles 12 --speed 15
+    uv run python scripts/test_weave.py --live --dist 150 --axis y
 """
 
 import argparse
@@ -38,7 +38,7 @@ import logging
 import sys
 import time
 
-import robot
+from nexon import robot
 
 
 def main():

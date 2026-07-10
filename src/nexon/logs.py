@@ -16,10 +16,14 @@ import os
 import sys
 from contextlib import contextmanager
 
-LOG_DIR = "Log"
+from nexon import paths
+
+# Anchored to the repo, not the working directory, so logs land in one place no
+# matter where the process was launched from.
+LOG_DIR = paths.LOG_DIR
 
 
-def setup(log_dir: str = LOG_DIR):
+def setup(log_dir=LOG_DIR):
     """Create a timestamped log file, send stderr into it, and return (logger, path)."""
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

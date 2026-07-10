@@ -246,13 +246,13 @@ def _draw(image_bgr: np.ndarray, detections: list[Detection]) -> np.ndarray:
 def main():
     """Grab one frame from the 336L and run detection against CLI-supplied targets.
 
-    Usage:  uv run python detector.py "metal tube" "flange" "bottle"
+    Usage:  uv run python -m nexon.perception.detector "metal tube" "flange" "bottle"
     """
     import sys
 
     import cv2
 
-    from camera import OrbbecCamera
+    from nexon.perception.camera import OrbbecCamera
 
     targets = sys.argv[1:] or ["bottle", "person", "laptop", "cup"]
     print(f"loading detector (first run downloads the model)…")

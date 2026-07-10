@@ -23,12 +23,12 @@ import time
 import cv2
 import numpy as np
 
-import marker
-import seam
-from camera import OrbbecCamera
-from detector import Detection, load_detector
-from dimensioner import measure_all
-from viz import colorize_depth, draw_detections
+from nexon.perception import marker
+from nexon.perception import seam
+from nexon.perception.camera import OrbbecCamera
+from nexon.perception.detector import Detection, load_detector
+from nexon.perception.dimensioner import measure_all
+from nexon.perception.viz import colorize_depth, draw_detections
 
 log = logging.getLogger("nexon")
 
@@ -420,7 +420,7 @@ class VisionHub:
         """Locate the seam LINE (joint between two parts) within the saved AOI.
 
         The seam line is found in RGB (the dark joint line) via seam.find_seam within the AOI
-        set by `uv run python seam.py` — this works for a flush joint too. Each endpoint's
+        set by `uv run python -m nexon.perception.seam` — this works for a flush joint too. Each endpoint's
         height (Z) is taken from a depth plane fit over the AOI (clean, on-surface); if depth
         is too sparse it falls back to a local depth patch. Deprojects to camera-frame XYZ;
         robot-agnostic, the caller applies the extrinsic. Returns p1/p2 pixels and
@@ -435,7 +435,7 @@ class VisionHub:
 
         aoi = seam.load_aoi()
         if aoi is None:
-            return {"error": "no seam AOI set — run 'uv run python seam.py' to draw one"}
+            return {"error": "no seam AOI set — run 'uv run python -m nexon.perception.seam' to draw one"}
 
         s = seam.find_seam(cap.bgr, cap.depth_mm, aoi)
         if s is None:

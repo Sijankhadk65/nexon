@@ -47,7 +47,7 @@ Two families:
     ported from red_line_viewer). When enabled, the seam traces run the arc sequence; `live`
     gates a REAL arc vs a dry weld. Both default off and never persist across restarts. Only
     the seam traces weld; follow_red_line never does.
-    follow_saved_seam traces a seam previously captured with 'w' in `uv run python seam.py`
+    follow_saved_seam traces a seam previously captured with 'w' in `uv run python -m nexon.perception.seam`
     (seam.json) instead of detecting live — a repeatable pass, valid while the camera hasn't
     moved.
 
@@ -61,14 +61,14 @@ import json
 import numpy as np
 from langchain_core.tools import tool
 
-import robot
-import seam
+from nexon import robot
+from nexon.perception import seam
 
 # Seam trace defaults, shared by detect_seam (preview) and follow_seam / follow_saved_seam so
 # the previewed lead-in / standoff match what the trace actually does.
 SEAM_STANDOFF_MM = 10.0   # height held ABOVE the detected seam surface for the whole trace
 SEAM_LEAD_IN_MM = 2.0     # -Y base-frame offset of the lead-in point before the seam start (very close to P1)
-import vision
+from nexon.perception import vision
 
 
 @tool(parse_docstring=True)
@@ -1172,7 +1172,7 @@ def detect_seam() -> str:
     XYZ with the seam's 3D length. Also previews how follow_seam would trace it: the LEAD-IN
     point (P1 offset -2 mm in base Y, the pre-seam / future arc-set point) and the standoff
     height (10 mm) the trace is held above the surface. p1/p2 base XYZ are the raw on-surface
-    readings; the trace runs standoff above them. Needs an AOI set via `uv run python seam.py`.
+    readings; the trace runs standoff above them. Needs an AOI set via `uv run python -m nexon.perception.seam`.
     Use this to see where the seam is (and where the lead-in lands) before tracing it.
     """
     try:
@@ -1258,7 +1258,7 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
                       lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
     """Trace the SAVED seam captured in the seam.py preview. Motion only UNLESS welding is enabled.
 
-    Loads the seam saved with 'w' in `uv run python seam.py` (seam.json) instead of detecting
+    Loads the seam saved with 'w' in `uv run python -m nexon.perception.seam` (seam.json) instead of detecting
     live, maps its endpoints to the base frame via the calibrated camera->base transform, then
     runs the same lead-in -> move to P1 -> traverse to P2 -> retract path as follow_seam, held
     `standoff_mm` above the seam (a weave overlays the P1->P2 traverse if enabled via set_weave).
@@ -1280,7 +1280,7 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
     rec = seam.load_seam()
     if rec is None:
         return json.dumps({"error": "no saved seam — capture one by pressing 'w' in "
-                                    "'uv run python seam.py'"})
+                                    "'uv run python -m nexon.perception.seam'"})
     try:
         b1 = robot.cam_to_base(rec["p1_cam_xyz_mm"])
         b2 = robot.cam_to_base(rec["p2_cam_xyz_mm"])

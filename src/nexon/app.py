@@ -31,8 +31,8 @@ from elevenlabs.client import ElevenLabs
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-import fsm
-import logs
+from nexon import logs
+from nexon.voice import fsm
 
 # tools/vision/stt are imported inside main() under logs.mute_stdout so their
 # SDK/ML startup chatter is captured in the log file, not printed to the screen.
@@ -453,10 +453,9 @@ def main():
     # Import the heavy modules with stdout muted so the SDK's "load extensions"
     # banner and any other import chatter land in the log, not on screen.
     with logs.mute_stdout(log_path):
-        import barge
-        import stt
-        import tools
-        import vision
+        from nexon.agent import tools
+        from nexon.perception import vision
+        from nexon.voice import barge, stt
 
     lang = DEFAULT_LANG if DEFAULT_LANG in LANGUAGES or DEFAULT_LANG == "auto" else "en"
 
@@ -685,7 +684,7 @@ def main():
 
 def _shutdown():
     try:
-        import tools  # imported inside main(); re-import here hits the module cache
+        from nexon.agent import tools  # imported inside main(); hits the module cache
 
         tools.shutdown()
     except Exception:  # noqa: BLE001

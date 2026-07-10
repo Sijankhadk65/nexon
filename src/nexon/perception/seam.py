@@ -13,7 +13,7 @@ seam. A perfectly invisible joint (no dark line, no depth step) can't be seen by
 camera — you'd need teaching / touch.
 
 Set the AOI once with the live preview (needs the camera):
-    uv run python seam.py
+    uv run python -m nexon.perception.seam
     drag a box over the joint (long side along the seam) -> 's' saves it -> 'q' quits.
 detect_seam / follow_seam then load that AOI automatically.
 
@@ -34,8 +34,10 @@ from pathlib import Path
 import cv2 as cv
 import numpy as np
 
-AOI_FILE = Path(__file__).resolve().parent / "seam_aoi.json"
-SEAM_FILE = Path(__file__).resolve().parent / "seam.json"
+from nexon import paths
+
+AOI_FILE = paths.DATA_DIR / "seam_aoi.json"
+SEAM_FILE = paths.DATA_DIR / "seam.json"
 
 DARK_K = 0.6           # a scan line's darkest pixel must be < mean - DARK_K*std to count
 INLIER_PX = 3.0        # line-fit inlier band (px) for the robust refit
@@ -216,7 +218,7 @@ def find_seam(bgr, depth_mm, aoi):
 
 def main():
     """Live preview to set the AOI and see the seam detection."""
-    from camera import OrbbecCamera
+    from nexon.perception.camera import OrbbecCamera
 
     try:
         cam = OrbbecCamera(with_depth=True)

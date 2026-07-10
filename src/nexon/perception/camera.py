@@ -6,7 +6,7 @@ models expect. The device also exposes depth and IR streams on the same pipeline
 but those aren't wired up yet; this module is RGB-only for now.
 
 Run it directly for a live preview (press q or Esc to quit):
-    uv run python camera.py
+    uv run python -m nexon.perception.camera
 
 With no display available (headless/SSH), it prints the measured frame rate and
 writes a single snapshot to `frame.jpg` instead of opening a window.
