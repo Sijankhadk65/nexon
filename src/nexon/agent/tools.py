@@ -43,10 +43,13 @@ Two families:
     is motion only UNLESS welding is enabled (set_weld), in which case it strikes the arc at the
     lead-in and welds P1->P2 (a DRY weld — identical motion, nothing energized — unless a live
     arc was armed).
-  - weld (`set_weld`, `get_weld_settings`): arc-welding config in robot.py (ARCStart/ARCEnd,
-    ported from red_line_viewer). When enabled, the seam traces run the arc sequence; `live`
-    gates a REAL arc vs a dry weld. Both default off and never persist across restarts. Only
-    the seam traces weld; follow_red_line never does.
+  - weld (`set_weld`, `arm_live_arc`, `disarm_live_arc`, `get_weld_settings`): arc-welding
+    config in robot.py (ARCStart/ARCEnd, ported from red_line_viewer). `set_weld` enables the
+    arc sequence as a DRY weld; striking a REAL arc additionally needs `arm_live_arc`, which
+    a human operator must approve at the machine — the agent cannot consent for itself. Both
+    default off and never persist across restarts. Only the seam traces weld; follow_red_line
+    never does. Every tool that moves or reconfigures the arm goes through nexon.controller,
+    which serialises motion and refuses mode changes mid-pass.
     follow_saved_seam traces a seam previously captured with 'w' in `uv run python -m nexon.perception.seam`
     (seam.json) instead of detecting live — a repeatable pass, valid while the camera hasn't
     moved.
@@ -56,12 +59,14 @@ prefer it first when a target might be out of reach. Call `shutdown()` on exit t
 release the camera.
 """
 
+import functools
 import json
 
 import numpy as np
 from langchain_core.tools import tool
 
 from nexon import robot
+from nexon.controller import Busy, Denied, NotArmable, get_controller
 from nexon.perception import seam
 
 # Seam trace defaults, shared by detect_seam (preview) and follow_seam / follow_saved_seam so
@@ -69,6 +74,41 @@ from nexon.perception import seam
 SEAM_STANDOFF_MM = 10.0   # height held ABOVE the detected seam surface for the whole trace
 SEAM_LEAD_IN_MM = 2.0     # -Y base-frame offset of the lead-in point before the seam start (very close to P1)
 from nexon.perception import vision
+
+
+# --------------------------------------------------------------------------- #
+# Everything that changes or moves the machine goes through the Controller
+# --------------------------------------------------------------------------- #
+# The agent is one of TWO clients now — a human at the UI is the other — so no tool may
+# touch robot.py's module globals directly. The controller is the single owner: it
+# serialises motion, locks out mode changes for the duration of a pass, and is the only
+# thing that can arm a live arc (and only with a human's consent).
+#
+# Its exceptions are turned into ordinary {"error": ...} results rather than being allowed
+# to escape. A refusal — "the operator declined", "a motion is already running" — is
+# something the model should read, explain, and work around; an exception escaping a tool
+# would instead kill the agent turn.
+
+def _refusal(exc, **extra) -> str:
+    return json.dumps({"error": str(exc), **extra})
+
+
+def _serialized(fn):
+    """Run this tool's body on the controller's motion worker, one pass at a time.
+
+    Blocks the agent until the pass finishes, which is what a synchronous tool call wants.
+    Busy means another motion (or the UI) already holds the arm, and comes back as a plain
+    error the model can act on.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return get_controller().run_motion(fn, *args, **kwargs).result()
+        except Busy as exc:
+            return _refusal(exc, busy=True)
+        except Exception as exc:  # noqa: BLE001 — a raising pass must not kill the turn
+            return _refusal(exc)
+    return wrapper
 
 
 @tool(parse_docstring=True)
@@ -131,6 +171,7 @@ def get_robot_pose() -> str:
 
 
 @tool(parse_docstring=True)
+@_serialized
 def robot_go_home(dry_run: bool = False) -> str:
     """Move the arm to its safe home configuration via MoveJ (joint-space, no IK needed).
 
@@ -156,6 +197,7 @@ def robot_go_home(dry_run: bool = False) -> str:
 
 
 @tool(parse_docstring=True)
+@_serialized
 def robot_move_to(
     x: float,
     y: float,
@@ -211,6 +253,7 @@ def robot_move_to(
 
 
 @tool(parse_docstring=True)
+@_serialized
 def robot_move_relative(
     dx: float = 0.0,
     dy: float = 0.0,
@@ -247,6 +290,7 @@ def robot_move_relative(
 
 
 @tool(parse_docstring=True)
+@_serialized
 def robot_move_direction(
     direction: str,
     distance_mm: float,
@@ -288,6 +332,7 @@ def robot_move_direction(
 
 
 @tool(parse_docstring=True)
+@_serialized
 def robot_move_joints(
     j1: float, j2: float, j3: float, j4: float, j5: float, j6: float,
     dry_run: bool = False,
@@ -338,10 +383,13 @@ def set_robot_velocity(velocity: float) -> str:
         velocity: Operation speed as a percentage of max, clamped to 1–100. Lower is safer.
     """
     try:
-        stored = robot.set_velocity(velocity)
+        state = get_controller().set_velocity(velocity)
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid velocity: {exc}"})
-    return json.dumps({"success": True, "operation_velocity": stored, "mode": robot.VEL_MODE})
+    except Busy as exc:
+        return _refusal(exc, busy=True)
+    return json.dumps({"success": True, "operation_velocity": state.velocity["percentage"],
+                       "mode": state.velocity["mode"]})
 
 
 @tool(parse_docstring=True)
@@ -378,9 +426,12 @@ def set_velocity_mode(mode: str) -> str:
         mode: Either "percentage" or "physical".
     """
     try:
-        stored = robot.set_velocity_mode(mode)
+        state = get_controller().set_velocity_mode(mode)
+        stored = state.velocity["mode"]
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid mode: {exc}"})
+    except Busy as exc:
+        return _refusal(exc, busy=True)
     active = robot.PHYSICAL_VEL if stored == "physical" else robot.CURRENT_VEL
     unit = "mm/s" if stored == "physical" else "%"
     return json.dumps({"success": True, "operation_mode": stored,
@@ -402,11 +453,14 @@ def set_physical_velocity(velocity_mm_s: float) -> str:
             Lower is safer.
     """
     try:
-        stored = robot.set_physical_velocity(velocity_mm_s)
+        state = get_controller().set_physical_velocity(velocity_mm_s)
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid velocity: {exc}"})
-    return json.dumps({"success": True, "operation_physical_velocity_mm_s": stored,
-                       "mode": robot.VEL_MODE})
+    except Busy as exc:
+        return _refusal(exc, busy=True)
+    return json.dumps({"success": True,
+                       "operation_physical_velocity_mm_s": state.velocity["physical_mm_s"],
+                       "mode": state.velocity["mode"]})
 
 
 @tool(parse_docstring=True)
@@ -425,9 +479,12 @@ def set_transport_velocity(velocity: float) -> str:
         velocity: Transportation speed as a percentage of max, clamped to 1–100. Lower is safer.
     """
     try:
-        stored = robot.set_transport_velocity(velocity)
+        state = get_controller().set_transport_velocity(velocity)
+        stored = state.velocity["transport_pct"]
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid velocity: {exc}"})
+    except Busy as exc:
+        return _refusal(exc, busy=True)
     return json.dumps({"success": True, "transport_velocity_pct": stored})
 
 
@@ -460,15 +517,17 @@ def set_weave(enabled: bool, pattern: str = "", amplitude_mm: float = 0.0,
             leaves it unset.
     """
     try:
-        settings = robot.configure_weave(
+        settings = get_controller().set_weave(
             enabled=enabled,
             pattern=pattern or None,
             amplitude_mm=amplitude_mm or None,
             cycles=cycles or None,
             pitch_mm=pitch_mm or None,
-        )
+        ).weave
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid weave setting: {exc}"})
+    except Busy as exc:
+        return _refusal(exc, busy=True)
     out = {"success": True, **settings}
     if enabled and robot.VEL_MODE != "physical":
         out["note"] = ("velocity mode is percentage — weave needs physical mm/s; call "
@@ -485,27 +544,30 @@ def get_weave_settings() -> str:
     (the `spacing` field says which; both stored values are reported). When enabled and the
     velocity mode is physical, weave overlays the follow_seam / follow_red_line traverse.
     """
-    return json.dumps(robot.weave_settings())
+    return json.dumps(get_controller().snapshot().weave)
 
 
 @tool(parse_docstring=True)
-def set_weld(enabled: bool, live: bool = False, arc_num: int = 0, io: int = -1,
+def set_weld(enabled: bool, arc_num: int = 0, io: int = -1,
              current: float = 0.0, voltage: float = 0.0, gas: bool = False) -> str:
-    """Turn ARC WELDING on/off for the seam trace and set the arc parameters. SAFETY-CRITICAL.
+    """Turn ARC WELDING on/off for the seam trace and set the arc parameters.
 
     When welding is ON, follow_seam / follow_saved_seam become a weld pass: descend to the
     lead-in -> ARCStart -> move to P1 -> traverse to P2 (the weld stroke; the weave rides it if
-    enabled) -> ARCEnd -> retract. Two gates: `enabled` runs the arc sequence at all, and
-    `live` energizes a REAL arc. With live=False (the default) it is a DRY WELD — the motion is
-    IDENTICAL and the arc steps are logged, but NOTHING is energized (no arc/gas/current); use
-    this to rehearse the full pass safely. Set live=True ONLY when you intend to strike a real
-    arc — it is never on by default and never persists across restarts. Current/voltage come
-    from the WebApp welding process (arc_num) over AO0/AO1 unless overridden. follow_red_line
-    never welds. Settings persist for the session; this does not move the arm.
+    enabled) -> ARCEnd -> retract. This tool alone always produces a DRY WELD — the motion is
+    IDENTICAL and the arc steps are logged, but NOTHING is energized (no arc/gas/current). Use
+    it to rehearse the full pass safely.
+
+    There is no `live` argument. Striking a REAL arc is a separate tool, arm_live_arc, which
+    requires a human operator to consent at the machine; you cannot grant that yourself. Any
+    call to set_weld also disarms a previously armed arc, so re-arming is always deliberate.
+
+    Current/voltage come from the WebApp welding process (arc_num) over AO0/AO1 unless
+    overridden. follow_red_line never welds. Settings persist for the session and never
+    survive a restart; this does not move the arm.
 
     Args:
         enabled: True to run the arc sequence on the next seam trace, False for a plain motion trace.
-        live: True to strike a REAL arc; False (default) is a dry weld (identical motion, nothing energized).
         arc_num: WebApp welding process number (ARCStart arcNum) that sets current/voltage. 0 or blank keeps the current value.
         io: ioType for weld signals — 0=controller IO, 1=extended IO. -1 or blank keeps the current value.
         current: OVERRIDE welding current in amps (via AO0). 0 or blank = use the arc_num process.
@@ -513,9 +575,8 @@ def set_weld(enabled: bool, live: bool = False, arc_num: int = 0, io: int = -1,
         gas: True to open shielding gas during the stroke; default False (gasless flux-cored).
     """
     try:
-        settings = robot.configure_weld(
+        state = get_controller().set_weld(
             enabled=enabled,
-            live=live,
             arc_num=arc_num or None,
             io=None if io < 0 else io,
             current=current or None,
@@ -524,22 +585,69 @@ def set_weld(enabled: bool, live: bool = False, arc_num: int = 0, io: int = -1,
         )
     except (TypeError, ValueError) as exc:
         return json.dumps({"error": f"invalid weld setting: {exc}"})
-    out = {"success": True, **settings}
-    if settings["enabled"] and settings["live"]:
-        out["warning"] = ("LIVE ARC ARMED — the next follow_seam / follow_saved_seam will "
-                          "strike a REAL arc. Set live=false for a dry rehearsal.")
+    except Busy as exc:
+        return _refusal(exc, busy=True)
+    out = {"success": True, **state.weld}
+    if state.dry_weld:
+        out["note"] = ("DRY weld — the next seam trace runs the full arc sequence with "
+                       "nothing energized. Use arm_live_arc to strike a real arc.")
     return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def arm_live_arc(reason: str) -> str:
+    """Ask the human operator for permission to strike a REAL welding arc. SAFETY-CRITICAL.
+
+    Call this ONLY when the user has clearly asked to actually weld. It does not arm anything
+    by itself: it puts the request to the operator at the machine, who must consent before the
+    arc is armed. You cannot approve it, and there is no argument that bypasses the prompt —
+    this blocks until a person answers, and a refusal comes back as an ordinary error.
+
+    Requires welding to be enabled first (set_weld(enabled=True)), so that the pass has been
+    rehearsed as a dry weld. Once armed, the NEXT follow_seam / follow_saved_seam strikes a
+    real arc. Arming does not move the arm, and cannot be done while a motion is running.
+    Use disarm_live_arc to stand down, and get_weld_settings to check the state.
+
+    Args:
+        reason: What you intend to weld, in one line — shown to the operator so they know
+            what they are approving (e.g. "weld the 85 mm butt joint on the saved seam").
+    """
+    try:
+        state = get_controller().arm_live_arc(reason)
+    except Busy as exc:
+        return _refusal(exc, busy=True)
+    except NotArmable as exc:
+        return _refusal(exc, armed=False)
+    except Denied as exc:
+        return _refusal(exc, armed=False, denied=True)
+    return json.dumps({"success": True, "armed": state.live_armed, **state.weld,
+                       "warning": "LIVE ARC ARMED — the next seam trace strikes a REAL arc."})
+
+
+@tool(parse_docstring=True)
+def disarm_live_arc() -> str:
+    """Stand down a live arc. Always safe, always allowed, and safe to call twice.
+
+    Leaves welding enabled, so the next seam trace is a DRY weld (identical motion, nothing
+    energized) rather than silently becoming a motion-only pass. Works even while a motion is
+    running. Call this whenever the user changes their mind, expresses doubt, or the plan
+    changes after arming.
+    """
+    state = get_controller().disarm()
+    return json.dumps({"success": True, "armed": state.live_armed, **state.weld})
 
 
 @tool(parse_docstring=True)
 def get_weld_settings() -> str:
     """Report the current ARC WELDING configuration. Read-only, never moves the arm.
 
-    Returns whether welding is enabled, whether it is LIVE (real arc) or a dry weld, and the
-    arc parameters (io, arc_num, current/voltage overrides, gas). When enabled, follow_seam /
-    follow_saved_seam run the arc sequence (dry unless live).
+    Returns whether welding is enabled, whether a live arc is ARMED (a real arc, requiring
+    operator consent via arm_live_arc) or the pass is a dry weld, the arc parameters (io,
+    arc_num, current/voltage overrides, gas), and whether a motion is currently running.
     """
-    return json.dumps(robot.weld_settings())
+    state = get_controller().snapshot()
+    return json.dumps({**state.weld, "armed": state.live_armed,
+                       "dry_weld": state.dry_weld, "busy": state.busy})
 
 
 @tool(parse_docstring=True)
@@ -559,7 +667,10 @@ def set_axis_movement(axis: str, enabled: bool) -> str:
         enabled: True to allow movement along the axis, False to lock it.
     """
     try:
-        stored = robot.set_axis_enabled(axis, enabled)
+        get_controller().set_axis_enabled(axis, enabled)
+        stored = robot.AXIS_ENABLED[str(axis).lower()]
+    except Busy as exc:
+        return _refusal(exc, busy=True)
     except (TypeError, ValueError, AttributeError) as exc:
         return json.dumps({"error": f"invalid axis: {exc}"})
     return json.dumps({"success": True, "axis": str(axis).lower(), "enabled": stored,
@@ -567,6 +678,7 @@ def set_axis_movement(axis: str, enabled: bool) -> str:
 
 
 @tool(parse_docstring=True)
+@_serialized
 def move_to_detection(
     target: str,
     hover_mm: float = 100.0,
@@ -921,6 +1033,7 @@ def _order_lines_greedy_nearest(lines):
 
 
 @tool(parse_docstring=True)
+@_serialized
 def move_to_red_marker(
     hover_mm: float = 100.0,
     descend_mm: float = 0.0,
@@ -1061,6 +1174,7 @@ def detect_red_lines(num_samples: int = 12) -> str:
 
 
 @tool(parse_docstring=True)
+@_serialized
 def follow_red_line(hover_mm: float = 60.0, num_samples: int = 12, dry_run: bool = False) -> str:
     """Trace EVERY red line in view, one after another — MOTION ONLY, never fires an arc/weld.
 
@@ -1205,6 +1319,7 @@ def detect_seam() -> str:
 
 
 @tool(parse_docstring=True)
+@_serialized
 def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
                 lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
     """Trace the seam (joint between two parts). Motion only UNLESS welding is enabled (set_weld).
@@ -1223,8 +1338,8 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
 
     WELDING: if enabled via set_weld, this becomes a weld pass — the arc is struck at the
     lead-in, kept lit through move-to-P1 and the P1->P2 stroke, and ended before the retract. It
-    is a DRY WELD (identical motion, nothing energized) unless set_weld(live=True) armed a REAL
-    arc. A dry_run never welds (it only IK-checks).
+    is a DRY WELD (identical motion, nothing energized) unless a human operator armed a REAL
+    arc via arm_live_arc. A dry_run never welds (it only IK-checks).
 
     ALWAYS prefer dry_run=True first: it IK-checks every waypoint without moving.
 
@@ -1254,6 +1369,7 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
 
 
 @tool(parse_docstring=True)
+@_serialized
 def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
                       lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
     """Trace the SAVED seam captured in the seam.py preview. Motion only UNLESS welding is enabled.
@@ -1263,7 +1379,8 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
     runs the same lead-in -> move to P1 -> traverse to P2 -> retract path as follow_seam, held
     `standoff_mm` above the seam (a weave overlays the P1->P2 traverse if enabled via set_weave).
     If welding is enabled (set_weld) this becomes a weld pass just like follow_seam — the arc is
-    struck at the lead-in and ended before the retract (a DRY weld unless set_weld(live=True)).
+    struck at the lead-in and ended before the retract (a DRY weld unless arm_live_arc was
+    approved by the operator).
     Use this to re-run a seam you captured earlier without re-detecting — the camera must NOT
     have moved since it was saved, as the endpoints are stored in the camera frame. Requires a
     saved seam (seam.json) and a saved extrinsic (T_base_cam.npy).
@@ -1315,6 +1432,8 @@ ALL_TOOLS = [
     get_weave_settings,
     set_weld,
     get_weld_settings,
+    arm_live_arc,
+    disarm_live_arc,
     set_axis_movement,
     robot_go_home,
     robot_move_to,

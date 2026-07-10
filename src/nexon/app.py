@@ -55,9 +55,13 @@ BASE_SYSTEM_PROMPT = (
     "and follow_seam (to trace it). follow_seam traces the seam held a fixed standoff above it, "
     "approaching a lead-in point just before the start. It is MOTION ONLY unless welding is "
     "enabled with set_weld: then it strikes the arc at the lead-in and welds P1->P2 — but that "
-    "is a DRY weld (identical motion, nothing energized) unless you explicitly arm a live arc "
-    "with set_weld(live=true). NEVER arm a live arc unless the user clearly asks to actually "
-    "weld. Read the weld state with get_weld_settings. For RED line(s)/tape (red-marked "
+    "is a DRY weld (identical motion, nothing energized). Striking a REAL arc needs "
+    "arm_live_arc, which asks the human operator at the machine to consent; you cannot approve "
+    "it yourself, and it blocks until they answer. Only call it when the user has clearly asked "
+    "to actually weld, and always rehearse with a dry pass first. If they decline, say so and "
+    "carry on — do not retry. disarm_live_arc stands down at any time and is always safe. "
+    "Read the weld state with get_weld_settings. Only one motion runs at a time: if a tool "
+    "reports busy, the arm is mid-pass — wait, don't retry. For RED line(s)/tape (red-marked "
     "paths, not a metal joint), use detect_red_line (one line), detect_red_lines (see/count all "
     "of them) and follow_red_line (traces every line by color, no AOI needed) — motion "
     "only, never welds. "
@@ -453,9 +457,16 @@ def main():
     # Import the heavy modules with stdout muted so the SDK's "load extensions"
     # banner and any other import chatter land in the log, not on screen.
     with logs.mute_stdout(log_path):
+        from nexon import controller
         from nexon.agent import tools
         from nexon.perception import vision
         from nexon.voice import barge, stt
+
+    # Only a HUMAN can consent to a real arc. Registering the console prompt is what makes
+    # arm_live_arc possible at all — with no authorizer the controller fails closed and the
+    # agent simply cannot weld for real. The Qt UI will register a dialog here instead.
+    # Safe on the chat loop's own thread: input() blocks it, and nothing else needs it.
+    controller.get_controller().set_arc_authorizer(controller.console_arc_authorizer)
 
     lang = DEFAULT_LANG if DEFAULT_LANG in LANGUAGES or DEFAULT_LANG == "auto" else "en"
 
@@ -683,8 +694,16 @@ def main():
 
 
 def _shutdown():
+    # Drop any armed arc before anything else, and independently of the vision teardown —
+    # an exception closing the camera must never leave a live arc armed.
     try:
-        from nexon.agent import tools  # imported inside main(); hits the module cache
+        from nexon import controller  # imported inside main(); hits the module cache
+
+        controller.get_controller().shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from nexon.agent import tools
 
         tools.shutdown()
     except Exception:  # noqa: BLE001
