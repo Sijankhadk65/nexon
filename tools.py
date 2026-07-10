@@ -40,7 +40,13 @@ Two families:
     between two parts) in the DEPTH map within a configured AOI (seam.py), map both endpoints
     to the base frame, and trace it (approach a LEAD-IN point just before the seam start ->
     move to P1 -> traverse to P2 -> retract), held a fixed standoff ABOVE the seam. follow_seam
-    is MOTION ONLY — it never fires an arc/weld output; it's a safe dry run of the path.
+    is motion only UNLESS welding is enabled (set_weld), in which case it strikes the arc at the
+    lead-in and welds P1->P2 (a DRY weld — identical motion, nothing energized — unless a live
+    arc was armed).
+  - weld (`set_weld`, `get_weld_settings`): arc-welding config in robot.py (ARCStart/ARCEnd,
+    ported from red_line_viewer). When enabled, the seam traces run the arc sequence; `live`
+    gates a REAL arc vs a dry weld. Both default off and never persist across restarts. Only
+    the seam traces weld; follow_red_line never does.
     follow_saved_seam traces a seam previously captured with 'w' in `uv run python seam.py`
     (seam.json) instead of detecting live — a repeatable pass, valid while the camera hasn't
     moved.
@@ -61,7 +67,7 @@ import seam
 # Seam trace defaults, shared by detect_seam (preview) and follow_seam / follow_saved_seam so
 # the previewed lead-in / standoff match what the trace actually does.
 SEAM_STANDOFF_MM = 10.0   # height held ABOVE the detected seam surface for the whole trace
-SEAM_LEAD_IN_MM = 5.0     # -Y base-frame offset of the lead-in point before the seam start
+SEAM_LEAD_IN_MM = 2.0     # -Y base-frame offset of the lead-in point before the seam start (very close to P1)
 import vision
 
 
@@ -483,6 +489,60 @@ def get_weave_settings() -> str:
 
 
 @tool(parse_docstring=True)
+def set_weld(enabled: bool, live: bool = False, arc_num: int = 0, io: int = -1,
+             current: float = 0.0, voltage: float = 0.0, gas: bool = False) -> str:
+    """Turn ARC WELDING on/off for the seam trace and set the arc parameters. SAFETY-CRITICAL.
+
+    When welding is ON, follow_seam / follow_saved_seam become a weld pass: descend to the
+    lead-in -> ARCStart -> move to P1 -> traverse to P2 (the weld stroke; the weave rides it if
+    enabled) -> ARCEnd -> retract. Two gates: `enabled` runs the arc sequence at all, and
+    `live` energizes a REAL arc. With live=False (the default) it is a DRY WELD — the motion is
+    IDENTICAL and the arc steps are logged, but NOTHING is energized (no arc/gas/current); use
+    this to rehearse the full pass safely. Set live=True ONLY when you intend to strike a real
+    arc — it is never on by default and never persists across restarts. Current/voltage come
+    from the WebApp welding process (arc_num) over AO0/AO1 unless overridden. follow_red_line
+    never welds. Settings persist for the session; this does not move the arm.
+
+    Args:
+        enabled: True to run the arc sequence on the next seam trace, False for a plain motion trace.
+        live: True to strike a REAL arc; False (default) is a dry weld (identical motion, nothing energized).
+        arc_num: WebApp welding process number (ARCStart arcNum) that sets current/voltage. 0 or blank keeps the current value.
+        io: ioType for weld signals — 0=controller IO, 1=extended IO. -1 or blank keeps the current value.
+        current: OVERRIDE welding current in amps (via AO0). 0 or blank = use the arc_num process.
+        voltage: OVERRIDE welding voltage in volts (via AO1). 0 or blank = use the arc_num process.
+        gas: True to open shielding gas during the stroke; default False (gasless flux-cored).
+    """
+    try:
+        settings = robot.configure_weld(
+            enabled=enabled,
+            live=live,
+            arc_num=arc_num or None,
+            io=None if io < 0 else io,
+            current=current or None,
+            voltage=voltage or None,
+            gas=gas,
+        )
+    except (TypeError, ValueError) as exc:
+        return json.dumps({"error": f"invalid weld setting: {exc}"})
+    out = {"success": True, **settings}
+    if settings["enabled"] and settings["live"]:
+        out["warning"] = ("LIVE ARC ARMED — the next follow_seam / follow_saved_seam will "
+                          "strike a REAL arc. Set live=false for a dry rehearsal.")
+    return json.dumps(out)
+
+
+@tool(parse_docstring=True)
+def get_weld_settings() -> str:
+    """Report the current ARC WELDING configuration. Read-only, never moves the arm.
+
+    Returns whether welding is enabled, whether it is LIVE (real arc) or a dry weld, and the
+    arc parameters (io, arc_num, current/voltage overrides, gas). When enabled, follow_seam /
+    follow_saved_seam run the arc sequence (dry unless live).
+    """
+    return json.dumps(robot.weld_settings())
+
+
+@tool(parse_docstring=True)
 def set_axis_movement(axis: str, enabled: bool) -> str:
     """Lock or unlock the arm's movement along a base-frame axis (X, Y, or Z).
 
@@ -583,7 +643,8 @@ def _hover_over_cam_xyz(cam_xyz, hover_mm, descend_mm, dry_run, meta, operation=
     return json.dumps(result)
 
 
-def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_in=None):
+def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_in=None,
+                         allow_weld=False):
     """Trace an ordered polyline of base-frame points: hover->descend->traverse each->retract.
 
     Shared by follow_seam and follow_red_line. `points` is an ordered list of length-3
@@ -639,12 +700,31 @@ def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_
                            "note": "weave needs physical velocity mode (mm/s) — "
                                    "call set_velocity_mode('physical')"}
         want_weave = False
+    # Weld: strike the arc once the tool has descended to the working height (at the lead-in if
+    # there is one, else at P1), keep it lit through the move-to-P1 + P1->P2 stroke, and end it
+    # before the retract. Only seam traces pass allow_weld; never on a dry run. The arc is
+    # ALWAYS ended in the finally, even on error, so it's never left struck. WELD_LIVE gates a
+    # REAL arc vs a dry weld (identical motion, nothing energized).
+    want_weld = allow_weld and robot.WELD_ENABLED and not dry_run
+    result["motion_only"] = not want_weld
     try:
         rob, tool, user = robot.connect_and_enable()
         ok = True
         weaving = False
+        arced = False
         try:
             for i, (label, x, y, z) in enumerate(waypoints):
+                # Strike the arc before the first working leg (move-to-P1, else the first
+                # traverse) — i.e. once we're at the lead-in / P1 working height. Abort the
+                # pass if it fails to establish (no stroke).
+                if want_weld and not arced and (label == "move_to_p1"
+                                                or label.startswith("traverse")):
+                    arced = robot.arc_start(rob)
+                    result["weld"] = {"struck": arced, **robot.weld_settings()}
+                    if not arced:
+                        result["weld"]["note"] = "arc did not establish — aborted before the stroke"
+                        ok = False
+                        break
                 # Begin the weave right before the first traverse leg (after descending to P1)
                 # so the oscillation rides the whole seam-following traverse; end it after the
                 # last traverse leg, before retracting straight up.
@@ -660,9 +740,15 @@ def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_
                             "effective_cycles": round(plan["cycles"], 1),
                             "effective_pitch_mm": round(plan["pitch_mm"], 2),
                             "weave_freq_hz": round(plan["freq_hz"], 3)})
-                if weaving and label == "retract":
-                    robot.weave_end(rob)
-                    weaving = False
+                # End the stroke overlays (weave, then arc) after the last traverse leg, before
+                # retracting straight up.
+                if label == "retract":
+                    if weaving:
+                        robot.weave_end(rob)
+                        weaving = False
+                    if arced:
+                        robot.arc_end(rob)
+                        arced = False
                 if i == 0:  # first waypoint (hover) may reorient a single axis if unreachable
                     ret = robot.linear_move_keep_orientation(rob, tool, user, x, y, z, dry_run=dry_run)
                 else:       # rest are pure translations along the line, orientation held
@@ -679,6 +765,8 @@ def _trace_polyline_base(points, hover_mm, dry_run, meta, standoff_mm=0.0, lead_
         finally:
             if weaving:
                 robot.weave_end(rob)
+            if arced:
+                robot.arc_end(rob)
         result["success"] = ok
         if not dry_run:
             result["final_pose"] = [round(v, 1) for v in rob.GetActualTCPPose()[1]]
@@ -1082,7 +1170,7 @@ def detect_seam() -> str:
     of interest (AOI) — the joint shows as a gap/step/crease in the surface. Returns both
     endpoints as pixels and — if the camera is calibrated (T_base_cam.npy) — as base-frame
     XYZ with the seam's 3D length. Also previews how follow_seam would trace it: the LEAD-IN
-    point (P1 offset -5 mm in base Y, the pre-seam / future arc-set point) and the standoff
+    point (P1 offset -2 mm in base Y, the pre-seam / future arc-set point) and the standoff
     height (10 mm) the trace is held above the surface. p1/p2 base XYZ are the raw on-surface
     readings; the trace runs standoff above them. Needs an AOI set via `uv run python seam.py`.
     Use this to see where the seam is (and where the lead-in lands) before tracing it.
@@ -1119,12 +1207,12 @@ def detect_seam() -> str:
 @tool(parse_docstring=True)
 def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
                 lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
-    """Trace the seam (joint between two parts) — MOTION ONLY, never fires an arc or weld output.
+    """Trace the seam (joint between two parts). Motion only UNLESS welding is enabled (set_weld).
 
     Locates the seam (geometrically, in depth within the AOI), maps both endpoints to the base
     frame via the calibrated camera->base transform, then runs: hover above the lead-in ->
-    descend to the LEAD-IN point (P1 offset -lead_in_mm in base Y, the pre-seam / future
-    arc-set point) -> move to P1 -> straight traverse to P2 -> retract. The WHOLE trace is held
+    descend to the LEAD-IN point (P1 offset -lead_in_mm in base Y, the pre-seam / arc-set
+    point) -> move to P1 -> straight traverse to P2 -> retract. The WHOLE trace is held
     `standoff_mm` above the seam's detected surface (so the tool follows the seam at a constant
     clearance, never touching it). The P1->P2 traverse runs at the OPERATION speed/mode (use
     physical mm/s for a real travel speed); the lead-in approach and positioning use the
@@ -1133,13 +1221,18 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
     current tool orientation (reorienting one axis only if a waypoint is unreachable); axis
     locks apply. Requires a saved extrinsic.
 
+    WELDING: if enabled via set_weld, this becomes a weld pass — the arc is struck at the
+    lead-in, kept lit through move-to-P1 and the P1->P2 stroke, and ended before the retract. It
+    is a DRY WELD (identical motion, nothing energized) unless set_weld(live=True) armed a REAL
+    arc. A dry_run never welds (it only IK-checks).
+
     ALWAYS prefer dry_run=True first: it IK-checks every waypoint without moving.
 
     Args:
         hover_mm: Approach/retract height above the lead-in / seam, in mm (default 60).
         standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
         lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
-            offset from P1, in mm (default 5). 0 disables the lead-in.
+            offset from P1, in mm (default 2, very close to P1). 0 disables the lead-in.
         dry_run: If true, IK-check all waypoints without moving the arm.
     """
     try:
@@ -1157,18 +1250,20 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
     # point). Same Z as P1; the standoff is added inside _trace_polyline_base.
     lead_in = None if lead_in_mm <= 0 else [b1[0], b1[1] - float(lead_in_mm), b1[2]]
     return _trace_polyline_base([b1, b2], hover_mm, dry_run, {},
-                                standoff_mm=standoff_mm, lead_in=lead_in)
+                                standoff_mm=standoff_mm, lead_in=lead_in, allow_weld=True)
 
 
 @tool(parse_docstring=True)
 def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
                       lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
-    """Trace the SAVED seam captured in the seam.py preview — MOTION ONLY, never fires an arc.
+    """Trace the SAVED seam captured in the seam.py preview. Motion only UNLESS welding is enabled.
 
     Loads the seam saved with 'w' in `uv run python seam.py` (seam.json) instead of detecting
     live, maps its endpoints to the base frame via the calibrated camera->base transform, then
     runs the same lead-in -> move to P1 -> traverse to P2 -> retract path as follow_seam, held
     `standoff_mm` above the seam (a weave overlays the P1->P2 traverse if enabled via set_weave).
+    If welding is enabled (set_weld) this becomes a weld pass just like follow_seam — the arc is
+    struck at the lead-in and ended before the retract (a DRY weld unless set_weld(live=True)).
     Use this to re-run a seam you captured earlier without re-detecting — the camera must NOT
     have moved since it was saved, as the endpoints are stored in the camera frame. Requires a
     saved seam (seam.json) and a saved extrinsic (T_base_cam.npy).
@@ -1179,7 +1274,7 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
         hover_mm: Approach/retract height above the lead-in / seam, in mm (default 60).
         standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
         lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
-            offset from P1, in mm (default 5). 0 disables the lead-in.
+            offset from P1, in mm (default 2, very close to P1). 0 disables the lead-in.
         dry_run: If true, IK-check all waypoints without moving the arm.
     """
     rec = seam.load_seam()
@@ -1198,7 +1293,7 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
     return _trace_polyline_base([b1, b2], hover_mm, dry_run,
                                 {"source": "saved_seam", "saved_at": rec.get("saved_at"),
                                  "length_mm": rec.get("length_mm")},
-                                standoff_mm=standoff_mm, lead_in=lead_in)
+                                standoff_mm=standoff_mm, lead_in=lead_in, allow_weld=True)
 
 
 # All tools exposed to the orchestrator. Add future robot tools here.
@@ -1218,6 +1313,8 @@ ALL_TOOLS = [
     set_transport_velocity,
     set_weave,
     get_weave_settings,
+    set_weld,
+    get_weld_settings,
     set_axis_movement,
     robot_go_home,
     robot_move_to,

@@ -212,6 +212,102 @@ def configure_weave(enabled=None, pattern=None, amplitude_mm=None, cycles=None, 
     return weave_settings()
 
 
+# --------------------------------------------------------------------------- #
+# Arc welding (arc struck during the seam trace)
+# --------------------------------------------------------------------------- #
+# Ported from red_line_viewer.weld_start/weld_end in the farino_app reference. When welding is
+# enabled, the seam trace becomes a weld pass: descend to the lead-in -> ARCStart -> move to
+# P1 -> traverse to P2 (the weld stroke; weave rides it if enabled) -> ARCEnd -> retract. Two
+# gates for safety:
+#   WELD_ENABLED -- run the arc sequence at all during the trace.
+#   WELD_LIVE    -- energize a REAL arc. When False it is a DRY WELD: the motion is IDENTICAL
+#                   and the arc steps are logged, but nothing is energized (no arc/gas/current).
+# Neither persists across process restarts (both default False), so a real arc must be armed
+# deliberately each session. Current/voltage normally come from the WebApp welding process
+# (WELD_ARC_NUM) over AO0/AO1; set WELD_CURRENT/WELD_VOLTAGE only to override.
+WELD_ENABLED = False
+WELD_LIVE = False          # False = dry weld (identical motion, nothing energized)
+WELD_IO = 0                # ioType: 0=controller IO, 1=extended IO
+WELD_ARC_NUM = 1           # WebApp welding process number (ARCStart arcNum)
+WELD_CURRENT = None        # A via AO0; None = use the WebApp process
+WELD_VOLTAGE = None        # V via AO1; None = use the WebApp process
+WELD_GAS = False           # open shielding gas (default off, for gasless flux-cored)
+ARC_TIMEOUT_MS = 10000     # ARCStart/ARCEnd strike/extinguish timeout (ms)
+
+
+def weld_settings():
+    """Current weld configuration as a plain dict (enabled/live/io/arc_num/current/voltage/gas)."""
+    return {"enabled": WELD_ENABLED, "live": WELD_LIVE, "io": WELD_IO,
+            "arc_num": WELD_ARC_NUM, "current_a": WELD_CURRENT, "voltage_v": WELD_VOLTAGE,
+            "gas": WELD_GAS}
+
+
+def configure_weld(enabled=None, live=None, io=None, arc_num=None, current=None, voltage=None,
+                   gas=None):
+    """Enable/disable welding and set the arc parameters. Only the given fields change.
+
+    enabled turns the arc sequence on for the seam trace; live=True energizes a REAL arc (vs a
+    dry weld — identical motion, nothing energized). current/voltage are overrides (None = use
+    the WebApp WELD_ARC_NUM process). Returns the resulting weld_settings(). Enabling a live arc
+    logs a prominent warning.
+    """
+    global WELD_ENABLED, WELD_LIVE, WELD_IO, WELD_ARC_NUM, WELD_CURRENT, WELD_VOLTAGE, WELD_GAS
+    if enabled is not None:
+        WELD_ENABLED = bool(enabled)
+    if live is not None:
+        WELD_LIVE = bool(live)
+        if WELD_LIVE:
+            log.warning("robot: LIVE ARC ARMED — the next seam trace will strike a REAL arc")
+    if io is not None:
+        WELD_IO = int(io)
+    if arc_num is not None:
+        WELD_ARC_NUM = int(arc_num)
+    if current is not None:
+        WELD_CURRENT = float(current)
+    if voltage is not None:
+        WELD_VOLTAGE = float(voltage)
+    if gas is not None:
+        WELD_GAS = bool(gas)
+    log.info("robot: weld %s | %s io=%d arc_num=%d current=%s voltage=%s gas=%s",
+             "ON" if WELD_ENABLED else "OFF", "LIVE" if WELD_LIVE else "dry",
+             WELD_IO, WELD_ARC_NUM, WELD_CURRENT, WELD_VOLTAGE, WELD_GAS)
+    return weld_settings()
+
+
+def arc_start(robot):
+    """Strike the welding arc for the stroke. Returns True if OK (mirrors weld_start in the reference).
+
+    DRY unless WELD_LIVE: when live is False this logs the steps but energizes nothing, so the
+    motion is identical to a real pass with no arc/gas/current. Current/voltage normally come
+    from the WebApp welding process (WELD_ARC_NUM) over AO0/AO1; only set here if overridden.
+    """
+    if not WELD_LIVE:
+        log.info("robot: [dry weld] would set current/voltage, open gas, ARCStart (nothing energized)")
+        return True
+    if WELD_CURRENT is not None:
+        robot.WeldingSetCurrent(WELD_IO, WELD_CURRENT, 0, 0)   # AO0 = current
+    if WELD_VOLTAGE is not None:
+        robot.WeldingSetVoltage(WELD_IO, WELD_VOLTAGE, 1, 0)   # AO1 = voltage
+    if WELD_GAS:
+        log.info("robot: gas ON")
+        robot.SetAspirated(WELD_IO, 1)
+    rc = robot.ARCStart(WELD_IO, WELD_ARC_NUM, ARC_TIMEOUT_MS)
+    log.info("robot: ARCStart(io=%d arc_num=%d) -> %s", WELD_IO, WELD_ARC_NUM, rc)
+    return rc == 0
+
+
+def arc_end(robot):
+    """End the welding arc and shut gas (mirrors weld_end). Safe to call even if never struck."""
+    if not WELD_LIVE:
+        log.info("robot: [dry weld] would ARCEnd + close gas")
+        return
+    rc = robot.ARCEnd(WELD_IO, WELD_ARC_NUM, ARC_TIMEOUT_MS)
+    log.info("robot: ARCEnd(io=%d arc_num=%d) -> %s", WELD_IO, WELD_ARC_NUM, rc)
+    if WELD_GAS:
+        robot.SetAspirated(WELD_IO, 0)
+        log.info("robot: gas OFF")
+
+
 def _movel_speed_kwargs(operation=False):
     """MoveL keyword args for a linear move — TRANSPORTATION speed unless operation=True.
 
