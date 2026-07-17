@@ -55,6 +55,11 @@ INLIER_PX = 3.0        # line-fit inlier band (px) floor for the robust refit
 MAX_RESID_FRAC = 0.35  # accept only if midline points hug the fitted line within this*win (px)
 MIN_SPAN_FRAC = 0.4    # seam must span at least this fraction of the AOI's long side
 MIN_PLANE_PTS = 200    # valid depth px in the AOI needed to fit the height plane
+# --- fillet / corner / T-joint mode: seam = intersection line of two non-coplanar planes ---
+PLANE_THRESH_MM = 3.0  # RANSAC 3D-plane inlier band (mm); ~ the depth sensor's plane noise
+PLANE_MIN_FRAC = 0.2   # each of the two planes must claim at least this fraction of AOI points
+DIHEDRAL_MIN_DEG = 20.0  # the two planes must meet at least this steeply (else it's ~one plane)
+SEAM_BAND_MM = 6.0     # points within this of the intersection line define the seam's extent
 WINDOW = "seam_aoi"
 
 
@@ -95,16 +100,22 @@ def seam_record(s, depth_mm, intrinsics):
            "p2_px": [round(s["p2"][0], 1), round(s["p2"][1], 1)],
            "length_px": round(s["length_px"], 1),
            "box": [int(v) for v in s["box"]]}
+    # The fillet path already has true 3D endpoints (from the plane intersection); use them
+    # directly. The groove path takes Z from the fitted AOI plane, else a local patch median.
+    fillet_xyz = s.get("p1_cam_xyz_mm") is not None and s.get("p2_cam_xyz_mm") is not None
     cams = []
     for name, (u, v) in (("p1", s["p1"]), ("p2", s["p2"])):
-        z = plane_z(s["plane"], u, v) if s["plane"] is not None else _sample_depth_mm(depth_mm, u, v)
-        if z <= 0:
-            return None
-        x, y, zc = intrinsics.deproject(u, v, z)
+        if fillet_xyz:
+            x, y, zc = s[f"{name}_cam_xyz_mm"]
+        else:
+            z = plane_z(s["plane"], u, v) if s["plane"] is not None else _sample_depth_mm(depth_mm, u, v)
+            if z <= 0:
+                return None
+            x, y, zc = intrinsics.deproject(u, v, z)
         rec[f"{name}_cam_xyz_mm"] = [float(x), float(y), float(zc)]
         cams.append(np.array([x, y, zc], float))
     rec["length_mm"] = round(float(np.linalg.norm(cams[1] - cams[0])), 1)
-    rec["depth_z"] = "plane" if s["plane"] is not None else "patch"
+    rec["depth_z"] = s.get("mode", "plane" if s["plane"] is not None else "patch")
     return rec
 
 
@@ -371,7 +382,173 @@ def find_seam(bgr, depth_mm, aoi):
         "resid_px": float(resid.mean()),
         "n_depth": n_depth,
         "n_rgb": n_rgb,
+        "mode": "groove",
     }
+
+
+# --------------------------------------------------------------------------------------
+# Fillet / corner / T-joint mode: the seam is the INTERSECTION LINE of two non-coplanar
+# planes (not a groove in one surface). Needs true 3D, so this path takes the intrinsics
+# and works on the deprojected point cloud. Sibling to find_seam; find_seam_auto dispatches.
+# --------------------------------------------------------------------------------------
+
+def _project(intr, X):
+    """Camera-frame points X (N,3 mm) -> pixel (u, v) arrays. Inverse of intr.deproject."""
+    x, y, z = X[:, 0], X[:, 1], X[:, 2]
+    return x * intr.fx / z + intr.cx, y * intr.fy / z + intr.cy
+
+
+def _deproject_aoi(depth_mm, aoi, intr):
+    """Valid (depth>0) pixels in the AOI -> (P Nx3 camera-frame mm, us, vs full-frame px)."""
+    h, w = depth_mm.shape
+    x1, y1, x2, y2 = _clamp(aoi, w, h)
+    crop = depth_mm[y1:y2, x1:x2]
+    vv, uu = np.where(crop > 0)
+    if uu.size == 0:
+        return None
+    us = (uu + x1).astype(np.float32)
+    vs = (vv + y1).astype(np.float32)
+    z = crop[vv, uu].astype(np.float32)
+    x, y, z = intr.deproject(us, vs, z)
+    return np.column_stack([x, y, z]).astype(np.float32), us, vs
+
+
+def _fit_plane_svd(P):
+    """Least-squares plane through points P (N,3) -> (unit normal n, offset d) with n·X = d."""
+    c = P.mean(axis=0)
+    _, _, vt = np.linalg.svd(P - c, full_matrices=False)
+    n = vt[-1]                      # direction of least variance = plane normal
+    return n, float(n @ c)
+
+
+def _ransac_plane(P, thresh, iters=200, seed=0):
+    """Robust 3-point RANSAC plane through P (N,3) -> (n, d, inlier_mask), or None.
+
+    The winning plane has the most points within `thresh` mm; refined by SVD on its inliers.
+    """
+    n = P.shape[0]
+    if n < 3:
+        return None
+    rng = np.random.default_rng(seed)
+    best_mask, best_count = None, -1
+    for _ in range(iters):
+        i, j, k = rng.integers(0, n, 3)
+        nrm = np.cross(P[j] - P[i], P[k] - P[i])
+        norm = np.linalg.norm(nrm)
+        if norm < 1e-6:
+            continue
+        nrm = nrm / norm
+        mask = np.abs((P - P[i]) @ nrm) < thresh
+        c = int(mask.sum())
+        if c > best_count:
+            best_count, best_mask = c, mask
+    if best_mask is None or best_count < 3:
+        return None
+    nvec, d = _fit_plane_svd(P[best_mask])
+    mask = np.abs(P @ nvec - d) < thresh          # final inliers under the refined plane
+    return nvec, d, mask
+
+
+def _plane_intersection(n1, d1, n2, d2):
+    """Intersection of planes n1·X=d1, n2·X=d2 -> (unit dir, point p0), or None if ~parallel."""
+    direction = np.cross(n1, n2)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:                               # parallel planes: no unique line
+        return None
+    direction = direction / norm
+    # p0 = the point on the line nearest the origin: solve [n1; n2; dir] x = [d1, d2, 0].
+    A = np.array([n1, n2, direction])
+    p0 = np.linalg.solve(A, np.array([d1, d2, 0.0]))
+    return direction, p0
+
+
+def find_fillet_seam(depth_mm, aoi, intrinsics):
+    """Seam as the intersection line of TWO non-coplanar planes in the AOI (fillet/T/corner).
+
+    Deprojects the AOI depth to a 3D cloud, RANSAC-fits a first plane, fits a second to the
+    remainder, and — if the two meet steeply enough (>= DIHEDRAL_MIN_DEG) — returns their
+    intersection line, clipped to the extent of the points that actually lie on the joint.
+    Returns a dict shaped like find_seam (p1/p2 in full-frame px, length_px, box, resid_px,
+    plane=None) plus 3D fields (p1_cam_xyz_mm, p2_cam_xyz_mm, length_mm, dihedral_deg) and
+    mode="fillet". Returns None when there aren't two clear, steeply-meeting planes (e.g. a
+    flat surface — let the groove path handle that).
+    """
+    if depth_mm is None or intrinsics is None or aoi is None:
+        return None
+    h, w = depth_mm.shape
+    x1, y1, x2, y2 = _clamp(aoi, w, h)
+    if x2 - x1 < 5 or y2 - y1 < 5:
+        return None
+    dep = _deproject_aoi(depth_mm, aoi, intrinsics)
+    if dep is None or dep[0].shape[0] < 2 * MIN_PLANE_PTS:
+        return None
+    P, _, _ = dep
+    n_total = P.shape[0]
+
+    fit1 = _ransac_plane(P, PLANE_THRESH_MM, seed=1)
+    if fit1 is None or fit1[2].sum() < PLANE_MIN_FRAC * n_total:
+        return None
+    n1, d1, m1 = fit1
+    rest = P[~m1]
+    if rest.shape[0] < PLANE_MIN_FRAC * n_total:
+        return None
+    fit2 = _ransac_plane(rest, PLANE_THRESH_MM, seed=2)
+    if fit2 is None or fit2[2].sum() < PLANE_MIN_FRAC * n_total:
+        return None
+    n2, d2, _ = fit2
+
+    # The planes must meet steeply — otherwise it's ~one surface (a groove/flat), not a fillet.
+    dihedral = np.degrees(np.arccos(min(1.0, abs(float(n1 @ n2)))))
+    dihedral = min(dihedral, 180.0 - dihedral)    # fold to the acute angle between the faces
+    if dihedral < DIHEDRAL_MIN_DEG:
+        return None
+
+    inter = _plane_intersection(n1, d1, n2, d2)
+    if inter is None:
+        return None
+    direction, p0 = inter
+
+    # Clip the infinite line to the joint: keep points near it, project onto dir, take extremes.
+    perp = P - p0 - np.outer((P - p0) @ direction, direction)
+    near = P[np.linalg.norm(perp, axis=1) < SEAM_BAND_MM]
+    if near.shape[0] < MIN_PLANE_PTS // 2:
+        return None
+    t = (near - p0) @ direction
+    a3d = p0 + float(np.percentile(t, 1)) * direction   # trim to reject stray endpoints
+    b3d = p0 + float(np.percentile(t, 99)) * direction
+    length_mm = float(np.linalg.norm(b3d - a3d))
+
+    (ua, ub), (va, vb) = _project(intrinsics, np.array([a3d, b3d]))
+    resid_mm = float(np.median(np.abs(np.linalg.norm(perp[np.linalg.norm(perp, axis=1) < SEAM_BAND_MM], axis=1))))
+    return {
+        "p1": (float(ua), float(va)),
+        "p2": (float(ub), float(vb)),
+        "length_px": float(np.hypot(ub - ua, vb - va)),
+        "box": (x1, y1, x2, y2),
+        "plane": None,
+        "resid_px": resid_mm,          # for fillet this is mm-off-line, not px (see mode)
+        "n_depth": int(m1.sum() + fit2[2].sum()),
+        "n_rgb": 0,
+        "mode": "fillet",
+        "dihedral_deg": float(dihedral),
+        "p1_cam_xyz_mm": [float(a3d[0]), float(a3d[1]), float(a3d[2])],
+        "p2_cam_xyz_mm": [float(b3d[0]), float(b3d[1]), float(b3d[2])],
+        "length_mm": length_mm,
+    }
+
+
+def find_seam_auto(bgr, depth_mm, aoi, intrinsics=None):
+    """Dispatch: try the fillet (two-plane) path first when depth+intrinsics allow, else groove.
+
+    The fillet path self-rejects on flat surfaces (the two planes come out ~coplanar), so a
+    butt/lap/grooved joint falls through to find_seam. Returns the same dict shape either way
+    (with a `mode` of "fillet" or "groove").
+    """
+    if depth_mm is not None and intrinsics is not None:
+        s = find_fillet_seam(depth_mm, aoi, intrinsics)
+        if s is not None:
+            return s
+    return find_seam(bgr, depth_mm, aoi)
 
 
 def main():
@@ -417,18 +594,21 @@ def main():
             last["capf"], last["s"] = capf, None
             if a is not None:
                 cv.rectangle(view, (a[0], a[1]), (a[2], a[3]), (0, 200, 255), 2)
-                s = find_seam(capf.bgr, capf.depth_mm, a)
+                s = find_seam_auto(capf.bgr, capf.depth_mm, a, capf.intrinsics)
                 last["s"] = s
                 if s is not None:
                     p1 = tuple(np.round(s["p1"]).astype(int))
                     p2 = tuple(np.round(s["p2"]).astype(int))
                     cv.line(view, p1, p2, (0, 255, 0), 2)
-                    zt = "" if s["plane"] is None else " +depth-Z"
-                    # show which signal carried it: depth-groove lines vs RGB-contrast lines
-                    src = f"depth{s['n_depth']}/rgb{s['n_rgb']}"
-                    cv.putText(view,
-                               f"seam {s['length_px']:.0f}px resid {s['resid_px']:.1f}px {src}{zt}",
-                               (a[0], a[1] - 8), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    if s.get("mode") == "fillet":
+                        label = (f"seam[fillet] {s['length_mm']:.0f}mm "
+                                 f"dihedral {s['dihedral_deg']:.0f}deg resid {s['resid_px']:.1f}mm")
+                    else:
+                        zt = "" if s["plane"] is None else " +depth-Z"
+                        src = f"depth{s['n_depth']}/rgb{s['n_rgb']}"
+                        label = f"seam[groove] {s['length_px']:.0f}px resid {s['resid_px']:.1f}px {src}{zt}"
+                    cv.putText(view, label, (a[0], a[1] - 8),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
                     cv.putText(view, "no seam in AOI", (a[0], a[1] - 8),
                                cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)

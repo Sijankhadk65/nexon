@@ -437,7 +437,7 @@ class VisionHub:
         if aoi is None:
             return {"error": "no seam AOI set — run 'uv run python seam.py' to draw one"}
 
-        s = seam.find_seam(cap.bgr, cap.depth_mm, aoi)
+        s = seam.find_seam_auto(cap.bgr, cap.depth_mm, aoi, cap.intrinsics)
         if s is None:
             return {"error": "no seam found in the AOI (no clear joint line — check the AOI "
                              "is tight with its long side along the seam)"}
@@ -450,8 +450,14 @@ class VisionHub:
             "p2_px": [round(s["p2"][0], 1), round(s["p2"][1], 1)],
             "length_px": round(s["length_px"], 1),
             "resid_px": round(s["resid_px"], 2),
+            "mode": s.get("mode", "groove"),
         }
+        # The fillet path already has true 3D endpoints (plane intersection); use them as-is.
+        fillet_xyz = s.get("p1_cam_xyz_mm") is not None and s.get("p2_cam_xyz_mm") is not None
         for name, (u, v) in (("p1", s["p1"]), ("p2", s["p2"])):
+            if fillet_xyz:
+                out[f"{name}_cam_xyz_mm"] = [float(c) for c in s[f"{name}_cam_xyz_mm"]]
+                continue
             if s["plane"] is not None:                       # clean on-surface Z from plane
                 z = seam.plane_z(s["plane"], u, v)
             else:                                            # fall back to a local depth patch
