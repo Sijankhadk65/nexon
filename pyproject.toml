@@ -10,6 +10,8 @@ dependencies = [
     "langchain-anthropic>=1.4.8",
     "langchain-core>=1.4.8",
     "numpy>=2.4.6",
+    "onnxruntime>=1.17",
+    "openwakeword>=0.6.0",
     "opencv-python>=5.0.0.93",
     "pyside6>=6.8",
     "pillow>=12.3.0",
@@ -19,6 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
+# One frontend, two names: `nexon-ui` is kept so existing muscle memory and scripts work.
 nexon = "nexon.app:main"
 nexon-ui = "nexon.ui.app:main"
 

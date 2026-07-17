@@ -1,8 +1,10 @@
 """Settings dialog: the Anthropic and ElevenLabs keys, and the TTS voice.
 
-The keys are not used by this process — the UI has no agent and no TTS. They are persisted
-for the chat app (`uv run nexon`), which calls settings.apply_to_env() at startup. Saving
-here therefore takes effect the next time the chat app starts, and the dialog says so.
+The keys are read once, by `session.start()`, which calls settings.apply_to_env() before it
+builds the Anthropic and ElevenLabs clients. Those clients then hold whatever they were
+given, so a key saved here takes effect the next time nexon starts — with one exception the
+window handles: if the session never started for want of a key, saving one retries the boot
+immediately rather than making the operator relaunch.
 
 Fetching the voice list is a network call against ElevenLabs, so it runs on a worker thread
 and returns through a signal. Nothing here blocks the GUI thread.

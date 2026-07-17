@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import wave
 
 import numpy as np
@@ -62,6 +63,17 @@ def _script_mismatch(text: str, lang: str | None) -> bool:
     return False
 
 
+# Scribe's audio-event annotations — "(static)", "[music]", "(soft chime)". Tagging is
+# turned off in the request, but a stray one still gets filtered here: a transcript that is
+# ONLY annotations is background noise the VAD mistook for speech, not something the user said.
+_NONSPEECH_RE = re.compile(r"[(\[][^)\]]*[)\]]")
+
+
+def _strip_nonspeech(text: str) -> str:
+    """The transcript with audio-event annotations removed, leaving only spoken words."""
+    return _NONSPEECH_RE.sub("", text).strip()
+
+
 def default_mic() -> str | None:
     """Pick the capture device for arecord's -D flag.
 
@@ -97,20 +109,35 @@ class VoiceInput:
         self.sample_rate = sample_rate
         self.device = device if device is not None else default_mic()
         self.language = language  # None => auto-detect
+        self._proc: subprocess.Popen | None = None   # the arecord child, while recording
+        self._wav: str | None = None
+        self._vad_proc: subprocess.Popen | None = None  # arecord child during record_until_silence
+        self._vad_cancel = threading.Event()            # set to abort that capture from another thread
 
     def _ensure_client(self):
         if self._client is None:
             from elevenlabs.client import ElevenLabs
 
-            self._client = ElevenLabs()  # reads ELEVENLABS_API_KEY
+            # api_key MUST be explicit: the elevenlabs SDK does not read ELEVENLABS_API_KEY
+            # itself, so a bare ElevenLabs() authenticates with nothing. Normally a client is
+            # passed in (session.py shares one); this covers a VoiceInput built on its own.
+            self._client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
         return self._client
 
-    def record(self) -> str | None:
-        """Record until the user presses Enter. Returns a WAV path, or None on failure.
+    @property
+    def recording(self) -> bool:
+        return self._proc is not None
 
-        arecord runs as a child process writing a mono 16-kHz WAV; the blocking
-        input() is the push-to-talk 'stop' — it returns when you press Enter.
+    def start_recording(self) -> bool:
+        """Begin capturing. Returns False if the mic could not be opened.
+
+        Split out of record() so a GUI can drive push-to-talk from a button's press and
+        release, where there is no blocking input() to stop on. Cheap and non-blocking:
+        arecord is spawned and writes in the background.
         """
+        if self._proc is not None:
+            return False  # already recording; a second press is a no-op, not a second file
+
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
         cmd = ["arecord", "-q", "-f", "S16_LE", "-r", str(self.sample_rate), "-c", "1"]
@@ -118,28 +145,68 @@ class VoiceInput:
             cmd += ["-D", self.device]
         cmd.append(tmp.name)
         try:
-            proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+            self._proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             log.error("voice: 'arecord' not found — install alsa-utils")
             os.unlink(tmp.name)
-            return None
+            return False
+        self._wav = tmp.name
+        return True
 
+    def stop_recording(self) -> str | None:
+        """Stop capturing and return the WAV path, or None if we weren't recording."""
+        proc, path = self._proc, self._wav
+        self._proc = self._wav = None
+        if proc is None:
+            return None
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return path
+
+    def cancel_listening(self) -> None:
+        """Abort an in-progress record_until_silence() from another thread.
+
+        Hands-free runs the silence-endpointed capture on a worker; this lets the GUI stop it
+        at once (the operator hit stop) instead of waiting out the silence timer. Killing
+        arecord unblocks the read loop, which then returns None — nothing captured.
+        """
+        self._vad_cancel.set()
+        proc = self._vad_proc
+        if proc is not None:
+            proc.terminate()
+
+    def record(self) -> str | None:
+        """Record until the user presses Enter. Returns a WAV path, or None on failure.
+
+        arecord runs as a child process writing a mono 16-kHz WAV; the blocking
+        input() is the push-to-talk 'stop' — it returns when you press Enter.
+        """
+        if not self.start_recording():
+            return None
         try:
             input()  # push-to-talk: Enter stops recording
         except (EOFError, KeyboardInterrupt):
             pass
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        return tmp.name
+        return self.stop_recording()
+
+    def stop_and_transcribe(self) -> str:
+        """End a start_recording() capture and return its transcript (maybe empty).
+
+        The GUI counterpart of listen(): the caller decided when to stop, so all that is
+        left is the part that must not run on a GUI thread — a network round trip.
+        """
+        return self._transcribe_and_cleanup(self.stop_recording())
 
     def transcribe(self, wav_path: str) -> str:
         """Upload the WAV to ElevenLabs Scribe and return the transcript."""
         client = self._ensure_client()
-        kwargs = {"model_id": self.model_id}
+        # tag_audio_events=False: without it, Scribe annotates room noise as "(static)",
+        # "(soft chime)", etc. — hands-free's VAD then feeds those to the model as if the user
+        # had spoken, and a quiet room turns into an endless self-triggering conversation.
+        kwargs = {"model_id": self.model_id, "tag_audio_events": False}
         if self.language:  # omit entirely to let Scribe auto-detect
             kwargs["language_code"] = self.language
         with open(wav_path, "rb") as audio:
@@ -152,19 +219,24 @@ class VoiceInput:
             log.info("voice: discarded off-language transcript (forced %s): %r",
                      self.language, text)
             return ""
+        # A transcript that is nothing but annotations is noise the endpointer mistook for
+        # speech — belt-and-suspenders behind tag_audio_events=False.
+        if text and not _strip_nonspeech(text):
+            log.info("voice: discarded non-speech transcript: %r", text)
+            return ""
         if not self.language and text:
             detected = getattr(resp, "language_code", None)
             if detected:
                 log.info("voice: detected language '%s'", detected)
         return text
 
-    def listen(self) -> str:
-        """Capture one push-to-talk utterance and return its transcript (maybe empty)."""
-        wav_path = self.record()
+    def _transcribe_and_cleanup(self, wav_path: str | None) -> str:
+        """Transcribe a captured WAV and delete it, whatever happens."""
         if wav_path is None:
             return ""
         try:
-            # Too-short clips (< ~0.3 s) are almost always an accidental double-Enter.
+            # Too-short clips (< ~0.3 s) are almost always an accidental tap — a stray
+            # Enter, or a mic button brushed rather than held.
             if os.path.getsize(wav_path) < self.sample_rate * 2 * 0.3:
                 return ""
             return self.transcribe(wav_path)
@@ -176,6 +248,10 @@ class VoiceInput:
                 os.unlink(wav_path)
             except OSError:
                 pass
+
+    def listen(self) -> str:
+        """Capture one push-to-talk utterance and return its transcript (maybe empty)."""
+        return self._transcribe_and_cleanup(self.record())
 
     def record_until_silence(self, silence_s: float = VAD_SILENCE_S,
                              max_s: float = VAD_MAX_S,
@@ -193,11 +269,13 @@ class VoiceInput:
                "-c", "1", "-t", "raw"]
         if self.device:
             cmd += ["-D", self.device]
+        self._vad_cancel.clear()
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             log.error("voice: 'arecord' not found — install alsa-utils")
             return None
+        self._vad_proc = proc  # so cancel_listening() can reach it from another thread
 
         frames = bytearray()
         started = False       # have we heard speech yet?
@@ -205,6 +283,8 @@ class VoiceInput:
         elapsed = 0.0
         try:
             while True:
+                if self._vad_cancel.is_set():
+                    break  # aborted from another thread (stop button)
                 buf = proc.stdout.read(frame_bytes)
                 if not buf or len(buf) < frame_bytes:
                     break  # stream ended
@@ -229,9 +309,10 @@ class VoiceInput:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
+            self._vad_proc = None
 
-        if not started:
-            return None
+        if not started or self._vad_cancel.is_set():
+            return None  # nothing said, or aborted mid-capture — discard whatever we have
 
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
@@ -244,18 +325,4 @@ class VoiceInput:
 
     def listen_until_silence(self) -> str:
         """Like listen(), but endpoints on silence instead of Enter (for barge-in)."""
-        wav_path = self.record_until_silence()
-        if wav_path is None:
-            return ""
-        try:
-            if os.path.getsize(wav_path) < self.sample_rate * 2 * 0.3:
-                return ""
-            return self.transcribe(wav_path)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("voice: transcription failed: %s", exc)
-            return ""
-        finally:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+        return self._transcribe_and_cleanup(self.record_until_silence())
