@@ -27,3 +27,7 @@
 /view.jpg
 /snapshot_*.jpg
 /Log/
+
+# Claiude
+/skills-lock.json
+/.agents
