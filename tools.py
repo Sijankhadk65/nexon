@@ -68,6 +68,13 @@ import seam
 # the previewed lead-in / standoff match what the trace actually does.
 SEAM_STANDOFF_MM = 10.0   # height held ABOVE the detected seam surface for the whole trace
 SEAM_LEAD_IN_MM = 2.0     # -Y base-frame offset of the lead-in point before the seam start (very close to P1)
+# Base-frame Y shift applied to BOTH seam endpoints before tracing — a manual trim for a
+# lateral bias between where the seam is detected and where the torch actually lands.
+# This is a correction, not a fix: the bias it compensates comes from the camera->base
+# calibration, so re-tune (usually back to 0) after any recalibration. Note it shifts along
+# base Y regardless of which way the seam runs, so it only reads as "sideways" for seams
+# roughly parallel to base X.
+SEAM_Y_OFFSET_MM = 0.0
 import vision
 
 
@@ -1204,9 +1211,15 @@ def detect_seam() -> str:
     return json.dumps(out)
 
 
+def _offset_y(p, y_offset_mm):
+    """Shift a base-frame point along Y. Returns a plain [x, y, z] list."""
+    return [float(p[0]), float(p[1]) + float(y_offset_mm), float(p[2])]
+
+
 @tool(parse_docstring=True)
 def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
-                lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
+                lead_in_mm: float = SEAM_LEAD_IN_MM,
+                y_offset_mm: float = SEAM_Y_OFFSET_MM, dry_run: bool = False) -> str:
     """Trace the seam (joint between two parts). Motion only UNLESS welding is enabled (set_weld).
 
     Locates the seam (geometrically, in depth within the AOI), maps both endpoints to the base
@@ -1233,6 +1246,9 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
         standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
         lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
             offset from P1, in mm (default 2, very close to P1). 0 disables the lead-in.
+        y_offset_mm: Base-frame Y trim applied to BOTH endpoints, in mm (default 0). Positive
+            shifts the pass toward +Y. Use it to correct a lateral bias between where the seam
+            is detected and where the torch actually lands; re-tune after any recalibration.
         dry_run: If true, IK-check all waypoints without moving the arm.
     """
     try:
@@ -1246,16 +1262,22 @@ def follow_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
         b2 = robot.cam_to_base(loc["p2_cam_xyz_mm"])
     except FileNotFoundError as exc:
         return json.dumps({"error": str(exc)})
+    # Trim BOTH endpoints together so the pass shifts sideways without rotating.
+    b1 = _offset_y(b1, y_offset_mm)
+    b2 = _offset_y(b2, y_offset_mm)
     # Lead-in: a point before the seam start, offset -lead_in_mm in base Y (later the arc-set
-    # point). Same Z as P1; the standoff is added inside _trace_polyline_base.
+    # point). Same Z as P1; the standoff is added inside _trace_polyline_base. Derived from the
+    # already-trimmed b1 so the lead-in tracks the offset pass.
     lead_in = None if lead_in_mm <= 0 else [b1[0], b1[1] - float(lead_in_mm), b1[2]]
-    return _trace_polyline_base([b1, b2], hover_mm, dry_run, {},
+    return _trace_polyline_base([b1, b2], hover_mm, dry_run,
+                                {"y_offset_mm": float(y_offset_mm)} if y_offset_mm else {},
                                 standoff_mm=standoff_mm, lead_in=lead_in, allow_weld=True)
 
 
 @tool(parse_docstring=True)
 def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF_MM,
-                      lead_in_mm: float = SEAM_LEAD_IN_MM, dry_run: bool = False) -> str:
+                      lead_in_mm: float = SEAM_LEAD_IN_MM,
+                      y_offset_mm: float = SEAM_Y_OFFSET_MM, dry_run: bool = False) -> str:
     """Trace the SAVED seam captured in the seam.py preview. Motion only UNLESS welding is enabled.
 
     Loads the seam saved with 'w' in `uv run python seam.py` (seam.json) instead of detecting
@@ -1275,6 +1297,9 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
         standoff_mm: Height held ABOVE the detected seam for the whole trace, in mm (default 10).
         lead_in_mm: How far before the seam start to place the lead-in point, as a -Y base-frame
             offset from P1, in mm (default 2, very close to P1). 0 disables the lead-in.
+        y_offset_mm: Base-frame Y trim applied to BOTH endpoints, in mm (default 0). Positive
+            shifts the pass toward +Y. Use it to correct a lateral bias between where the seam
+            is detected and where the torch actually lands; re-tune after any recalibration.
         dry_run: If true, IK-check all waypoints without moving the arm.
     """
     rec = seam.load_seam()
@@ -1289,10 +1314,13 @@ def follow_saved_seam(hover_mm: float = 60.0, standoff_mm: float = SEAM_STANDOFF
     except (KeyError, TypeError):
         return json.dumps({"error": "saved seam is missing camera-frame endpoints — "
                                     "re-save it with 'w' in seam.py"})
+    b1 = _offset_y(b1, y_offset_mm)
+    b2 = _offset_y(b2, y_offset_mm)
     lead_in = None if lead_in_mm <= 0 else [b1[0], b1[1] - float(lead_in_mm), b1[2]]
     return _trace_polyline_base([b1, b2], hover_mm, dry_run,
                                 {"source": "saved_seam", "saved_at": rec.get("saved_at"),
-                                 "length_mm": rec.get("length_mm")},
+                                 "length_mm": rec.get("length_mm"),
+                                 **({"y_offset_mm": float(y_offset_mm)} if y_offset_mm else {})},
                                 standoff_mm=standoff_mm, lead_in=lead_in, allow_weld=True)
 
 
