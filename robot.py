@@ -73,7 +73,7 @@ VEL_MODES = ("percentage", "physical")
 # defaults (vel=20, acc=0) is what caused the physical move to fail. See red_line_viewer
 # ._movel in the farino_app reference.
 PHYSICAL_VEL_MIN, PHYSICAL_VEL_MAX = 1.0, 250.0
-PHYSICAL_VEL = 30.0   # linear TCP speed, mm/s
+PHYSICAL_VEL = 3.0   # linear TCP speed, mm/s
 PHYSICAL_ACC = 200.0  # linear acceleration, mm/s^2 (must be > 0)
 
 
